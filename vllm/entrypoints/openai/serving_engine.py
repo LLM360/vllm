@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import inspect
 import json
 import sys
 import time
@@ -285,7 +286,7 @@ class OpenAIServing:
 
     def _get_tool_parser(
         self, tool_parser_name: str | None = None, enable_auto_tools: bool = False
-    ) -> Callable[[TokenizerLike], ToolParser] | None:
+    ) -> type[ToolParser] | None:
         """Get the tool parser based on the name."""
         parser = None
         if not enable_auto_tools or tool_parser_name is None:
@@ -1082,7 +1083,7 @@ class OpenAIServing:
         tool_dicts: list[dict[str, Any]] | None = None,
         documents: list[dict[str, str]] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-        tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
+        tool_parser: type[ToolParser] | None = None,
         add_special_tokens: bool = False,
     ) -> tuple[
         list[ConversationMessage],
@@ -1153,7 +1154,11 @@ class OpenAIServing:
                     "or Responses API requests."
                 )
                 raise NotImplementedError(msg)
-            request = tool_parser(tokenizer).adjust_request(request=request)  # type: ignore
+            request = self._create_tool_parser(
+                tool_parser,
+                tokenizer,
+                chat_template_kwargs=chat_template_kwargs,
+            ).adjust_request(request=request)
 
         if tokenizer is None:
             assert isinstance(request_prompt, str), (
@@ -1367,12 +1372,52 @@ class OpenAIServing:
             return None
 
     @staticmethod
+    def _get_tool_parser_init_kwargs(
+        tool_parser_cls: type[ToolParser],
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not chat_template_kwargs:
+            return {}
+
+        try:
+            init_signature = inspect.signature(tool_parser_cls.__init__)
+        except (TypeError, ValueError):
+            return {}
+
+        if "chat_template_kwargs" in init_signature.parameters:
+            return {"chat_template_kwargs": chat_template_kwargs}
+
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in init_signature.parameters.values()
+        ):
+            return {"chat_template_kwargs": chat_template_kwargs}
+
+        return {}
+
+    @classmethod
+    def _create_tool_parser(
+        cls,
+        tool_parser_cls: type[ToolParser],
+        tokenizer: TokenizerLike,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> ToolParser:
+        return tool_parser_cls(
+            tokenizer,
+            **cls._get_tool_parser_init_kwargs(
+                tool_parser_cls,
+                chat_template_kwargs,
+            ),
+        )
+
+    @staticmethod
     def _parse_tool_calls_from_content(
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike,
         enable_auto_tools: bool,
-        tool_parser_cls: Callable[[TokenizerLike], ToolParser] | None,
+        tool_parser_cls: type[ToolParser] | None,
         content: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> tuple[list[FunctionCall] | None, str | None]:
         function_calls = list[FunctionCall]()
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
@@ -1411,7 +1456,11 @@ class OpenAIServing:
         ):
             # Automatic Tool Call Parsing
             try:
-                tool_parser = tool_parser_cls(tokenizer)
+                tool_parser = OpenAIServing._create_tool_parser(
+                    tool_parser_cls,
+                    tokenizer,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
             except RuntimeError as e:
                 logger.exception("Error in tool parser creation.")
                 raise e
