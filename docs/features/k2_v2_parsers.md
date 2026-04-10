@@ -1,0 +1,107 @@
+# K2-V2 Reasoning and Tool Calling
+
+This page documents how to use the LLM360 K2-V2 reasoning parser and the
+multi-format tool calling parser from the LLM360 `v0.12.0-ifm` branch.
+
+!!! note
+    This workflow is specific to the LLM360 fork and branch. It is not the
+    default upstream vLLM configuration.
+
+## Clone and Install
+
+Use the LLM360 fork for this setup:
+
+```bash
+git clone https://github.com/LLM360/vllm.git
+cd vllm
+git switch v0.12.0-ifm
+VLLM_USE_PRECOMPILED=1 uv pip install --editable .
+```
+
+## Start the Server
+
+Run K2-V2 with the reasoning parser and the multi-format tool parser enabled:
+
+```bash
+vllm serve LLM360/K2-V2-Instruct \
+    --tensor-parallel-size 8 \
+    --port 8000 \
+    --reasoning-parser k2_v2 \
+    --default-chat-template-kwargs '{"reasoning_effort":"medium"}' \
+    --enable-auto-tool-choice \
+    --tool-call-parser multi_format
+```
+
+## Required Settings
+
+Use these settings to enable the K2-V2 reasoning parser and tool calling flow:
+
+- `--reasoning-parser k2_v2`
+- `--tool-call-parser multi_format`
+- `--enable-auto-tool-choice`
+- `--default-chat-template-kwargs '{"reasoning_effort":"medium"}'`
+
+At request time, pass the chat template kwargs through `extra_body`:
+
+- `reasoning_effort`: selects the reasoning effort level
+- `tool_format`: selects the tool-call output format used by the parser
+
+## OpenAI-Compatible Client Example
+
+The example below uses `tool_choice="auto"` and sets both `tool_format` and
+`reasoning_effort` in `chat_template_kwargs`.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy")
+
+resp = client.chat.completions.create(
+    model="LLM360/K2-V2-Instruct",
+    messages=[
+        {
+            "role": "user",
+            "content": "What is the weather in San Francisco?",
+        }
+    ],
+    tools=[
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "unit": {"type": "string"},
+                    },
+                    "required": ["location"],
+                },
+            },
+        }
+    ],
+    tool_choice="auto",
+    extra_body={
+        "chat_template_kwargs": {
+            "tool_format": "gptoss",
+            "reasoning_effort": "medium",
+        }
+    },
+)
+
+message = resp.choices[0].message
+print("reasoning:", message.reasoning)
+print("content:", message.content)
+print("tool_calls:", message.tool_calls)
+```
+
+## Summary
+
+For the LLM360 `v0.12.0-ifm` branch:
+
+- use `k2_v2` as the reasoning parser
+- use `multi_format` as the tool-call parser
+- set `reasoning_effort` in the server defaults and in request-time
+  `chat_template_kwargs`
+- set `tool_format` in request-time `chat_template_kwargs`
