@@ -76,12 +76,12 @@ def test_qwen3_format_delegates_to_qwen3xml():
     assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "Tokyo"}
 
 
-def test_glm_format_delegates_to_glm47():
+def test_glm_format_matches_template_output():
     parser = make_parser("glm")
 
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        "<tool_call>get_weather\n<arg_key>city</arg_key>"
+        "<tool_call>get_weather<arg_key>city</arg_key>"
         "<arg_value>Beijing</arg_value></tool_call>",
         make_request(),
     )
@@ -226,6 +226,24 @@ def test_python_format_extracts_multiple_calls():
     }
 
 
+def test_python_format_accepts_nested_json_style_literals():
+    parser = make_parser("python")
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        '<tool_call>\n'
+        'get_weather(city="SF", meta={"enabled": true, "missing": null})\n'
+        '</tool_call>',
+        make_request(),
+    )
+
+    assert extracted.tools_called
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "city": "SF",
+        "meta": {"enabled": True, "missing": None},
+    }
+
+
 def test_custom_formats_do_not_stream_yet():
     parser = make_parser("python")
 
@@ -302,7 +320,7 @@ def test_readme_glm_example():
     parser = make_parser("glm")
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        "<tool_call>get_weather\n"
+        "<tool_call>get_weather"
         "<arg_key>location</arg_key><arg_value>San Francisco, CA</arg_value>"
         "</tool_call>",
         make_request(),
