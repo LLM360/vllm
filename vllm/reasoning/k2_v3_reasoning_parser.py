@@ -5,11 +5,11 @@ from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParse
 from vllm.tokenizers import TokenizerLike
 
 
-class K2V2ReasoningParser(DeepSeekR1ReasoningParser):
+class K2V3ReasoningParser(DeepSeekR1ReasoningParser):
     """
-    Reasoning parser for the K2-v2-instruct model.
+    Reasoning parser for the K2-v3 model family.
 
-    K2-v2 supports three reasoning effort levels, each using different
+    K2-v3 supports three reasoning effort levels, each using different
     think tokens:
       - high (default): <think> / </think>
       - medium:         <think_fast> / </think_fast>

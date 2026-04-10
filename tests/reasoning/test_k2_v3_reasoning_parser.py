@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 from tests.reasoning.utils import run_reasoning_extraction
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 
-PARSER_NAME = "k2_v2"
+PARSER_NAME = "k2_v3"
 REASONING_MODEL_NAME = "LLM360/K2-V2-Instruct"
 
 EFFORT_TOKENS = {
@@ -18,7 +18,7 @@ EFFORT_TOKENS = {
 
 
 @pytest.fixture(scope="module")
-def k2_v2_tokenizer():
+def k2_v3_tokenizer():
     return AutoTokenizer.from_pretrained(REASONING_MODEL_NAME, trust_remote_code=True)
 
 
@@ -106,13 +106,13 @@ def test_reasoning(
     effort: str,
     streaming: bool,
     param_dict: dict,
-    k2_v2_tokenizer,
+    k2_v3_tokenizer,
 ):
-    output = k2_v2_tokenizer.tokenize(param_dict["output"])
+    output = k2_v3_tokenizer.tokenize(param_dict["output"])
     output_tokens: list[str] = [
-        k2_v2_tokenizer.convert_tokens_to_string([token]) for token in output
+        k2_v3_tokenizer.convert_tokens_to_string([token]) for token in output
     ]
-    parser = _make_parser(k2_v2_tokenizer, effort)
+    parser = _make_parser(k2_v3_tokenizer, effort)
 
     reasoning, content = run_reasoning_extraction(
         parser, output_tokens, streaming=streaming
@@ -122,14 +122,14 @@ def test_reasoning(
     assert content == param_dict["content"]
 
     # Test is_reasoning_end
-    output_ids = k2_v2_tokenizer.convert_tokens_to_ids(output)
+    output_ids = k2_v3_tokenizer.convert_tokens_to_ids(output)
     assert parser.is_reasoning_end(output_ids) == param_dict["is_reasoning_end"]
 
     # Test extract_content_ids
     if param_dict["content"] is not None:
         content_ids = parser.extract_content_ids(output_ids)
-        expected_ids = k2_v2_tokenizer.convert_tokens_to_ids(
-            k2_v2_tokenizer.tokenize(param_dict["content"])
+        expected_ids = k2_v3_tokenizer.convert_tokens_to_ids(
+            k2_v3_tokenizer.tokenize(param_dict["content"])
         )
         assert content_ids == expected_ids
     else:
@@ -141,22 +141,22 @@ def test_reasoning(
 # ---------------------------------------------------------------------------
 
 
-def test_default_effort_is_high(k2_v2_tokenizer):
+def test_default_effort_is_high(k2_v3_tokenizer):
     """Parser with no reasoning_effort should use <think>/<\/think>."""
-    parser = ReasoningParserManager.get_reasoning_parser(PARSER_NAME)(k2_v2_tokenizer)
+    parser = ReasoningParserManager.get_reasoning_parser(PARSER_NAME)(k2_v3_tokenizer)
     assert parser.start_token == "<think>"
     assert parser.end_token == "</think>"
 
 
-def test_none_effort_falls_back_to_high(k2_v2_tokenizer):
+def test_none_effort_falls_back_to_high(k2_v3_tokenizer):
     """reasoning_effort='none' should fall back to high tokens."""
-    parser = _make_parser(k2_v2_tokenizer, "none")
+    parser = _make_parser(k2_v3_tokenizer, "none")
     assert parser.start_token == "<think>"
     assert parser.end_token == "</think>"
 
 
-def test_unknown_effort_falls_back_to_high(k2_v2_tokenizer):
+def test_unknown_effort_falls_back_to_high(k2_v3_tokenizer):
     """Unknown effort value should fall back to high tokens."""
-    parser = _make_parser(k2_v2_tokenizer, "ultra")
+    parser = _make_parser(k2_v3_tokenizer, "ultra")
     assert parser.start_token == "<think>"
     assert parser.end_token == "</think>"
