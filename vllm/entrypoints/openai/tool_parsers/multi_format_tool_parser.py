@@ -84,6 +84,7 @@ class MultiFormatToolParser(ToolParser):
             )
 
             self._delegate = Qwen3XMLToolParser(tokenizer)
+
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
         if self._delegate is not None:
             return self._delegate.adjust_request(request)
