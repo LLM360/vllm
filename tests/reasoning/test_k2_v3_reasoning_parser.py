@@ -2,13 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
-from transformers import AutoTokenizer
 
 from tests.reasoning.utils import run_reasoning_extraction
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 
 PARSER_NAME = "k2_v3"
-REASONING_MODEL_NAME = "LLM360/K2-V2-Instruct"
 
 EFFORT_TOKENS = {
     "high": ("<think>", "</think>"),
@@ -17,9 +15,59 @@ EFFORT_TOKENS = {
 }
 
 
+class FakeTokenizer:
+    _SPECIAL_TOKENS = sorted(
+        {
+            token
+            for token_pair in EFFORT_TOKENS.values()
+            for token in token_pair
+        },
+        key=len,
+        reverse=True,
+    )
+
+    def __init__(self):
+        self._vocab: dict[str, int] = {
+            token: token_id
+            for token_id, token in enumerate(self._SPECIAL_TOKENS, start=1)
+        }
+        self._next_token_id = len(self._vocab) + 1
+
+    def get_vocab(self):
+        return self._vocab
+
+    def tokenize(self, text: str) -> list[str]:
+        tokens: list[str] = []
+        i = 0
+        while i < len(text):
+            for special_token in self._SPECIAL_TOKENS:
+                if text.startswith(special_token, i):
+                    tokens.append(special_token)
+                    i += len(special_token)
+                    break
+            else:
+                tokens.append(text[i])
+                i += 1
+        return tokens
+
+    def convert_tokens_to_string(self, tokens: list[str]) -> str:
+        return "".join(tokens)
+
+    def convert_tokens_to_ids(self, tokens):
+        if isinstance(tokens, str):
+            return self._token_to_id(tokens)
+        return [self._token_to_id(token) for token in tokens]
+
+    def _token_to_id(self, token: str) -> int:
+        if token not in self._vocab:
+            self._vocab[token] = self._next_token_id
+            self._next_token_id += 1
+        return self._vocab[token]
+
+
 @pytest.fixture(scope="module")
 def k2_v3_tokenizer():
-    return AutoTokenizer.from_pretrained(REASONING_MODEL_NAME, trust_remote_code=True)
+    return FakeTokenizer()
 
 
 def _make_parser(tokenizer, effort="high") -> ReasoningParser:

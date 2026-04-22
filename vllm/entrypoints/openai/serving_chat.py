@@ -599,7 +599,11 @@ class OpenAIServingChat(OpenAIServing):
         try:
             if tool_choice_auto and self.tool_parser:
                 tool_parsers: list[ToolParser | None] = [
-                    self.tool_parser(tokenizer)
+                    self._create_tool_parser(
+                        self.tool_parser,
+                        tokenizer,
+                        chat_template_kwargs=request.chat_template_kwargs,
+                    )
                 ] * num_choices
             else:
                 tool_parsers = [None] * num_choices
@@ -1344,7 +1348,11 @@ class OpenAIServingChat(OpenAIServing):
                     reasoning = None
 
                 if self.tool_parser is not None:
-                    tool_parser = self.tool_parser(tokenizer)
+                    tool_parser = self._create_tool_parser(
+                        self.tool_parser,
+                        tokenizer,
+                        chat_template_kwargs=request.chat_template_kwargs,
+                    )
                     # NOTE: We use token_ids for openai tool parser
                     tool_call_info = tool_parser.extract_tool_calls(
                         "",
@@ -1413,6 +1421,7 @@ class OpenAIServingChat(OpenAIServing):
                 content=content,
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
+                chat_template_kwargs=request.chat_template_kwargs,
             )
             tool_call_class = (
                 MistralToolCall if isinstance(tokenizer, MistralTokenizer) else ToolCall

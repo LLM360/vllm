@@ -90,6 +90,10 @@ _TOOL_PARSERS_TO_REGISTER = {
         "minimax_tool_parser",
         "MinimaxToolParser",
     ),
+    "multi_format": (
+        "multi_format_tool_parser",
+        "MultiFormatToolParser",
+    ),
     "mistral": (
         "mistral_tool_parser",
         "MistralToolParser",

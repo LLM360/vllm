@@ -855,6 +855,7 @@ class OpenAIServingResponses(OpenAIServing):
             content=content,
             enable_auto_tools=self.enable_auto_tools,
             tool_parser_cls=self.tool_parser,
+            chat_template_kwargs=request.chat_template_kwargs,
         )
         if content:
             output_text = ResponseOutputText(
