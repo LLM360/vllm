@@ -24,7 +24,21 @@ logger = init_logger(__name__)
 
 
 class MultiFormatToolParser(ToolParser):
-    """Tool parser that dispatches on ``chat_template_kwargs['tool_format']``."""
+    """Tool parser that dispatches on chat template tool-call format kwargs."""
+
+    _SUPPORTED_TOOL_FORMATS = frozenset(
+        {
+            "qwen3",
+            "minimax",
+            "dsv32",
+            "glm",
+            "gptoss",
+            "python",
+            "json",
+            "xml",
+            "xml_typed",
+        }
+    )
 
     _MINIMAX_START_TOKEN = "<tool_calls>"
     _MINIMAX_BLOCK_REGEX = re.compile(
@@ -51,6 +65,20 @@ class MultiFormatToolParser(ToolParser):
         r"<tool_call>(.*?)</tool_call>",
         re.DOTALL,
     )
+
+    _IFM_TOOL_CALLS_START_TOKEN = "<ifm|tool_calls>"
+    _IFM_TOOL_CALL_START_TOKEN = "<ifm|tool_call>"
+    _IFM_BLOCK_REGEX = re.compile(
+        r"<ifm\|tool_call>(.*?)</ifm\|tool_call>",
+        re.DOTALL,
+    )
+    _IFM_ARG_REGEX = re.compile(
+        r"<ifm\|arg_key>(.*?)</ifm\|arg_key>\s*"
+        r"(?:<ifm\|arg_type>(.*?)</ifm\|arg_type>\s*)?"
+        r"<ifm\|arg_value>(.*?)</ifm\|arg_value>",
+        re.DOTALL,
+    )
+
     _GLM_BLOCK_REGEX = re.compile(
         r"<tool_call>(.*?)</tool_call>",
         re.DOTALL,
@@ -67,23 +95,37 @@ class MultiFormatToolParser(ToolParser):
     ):
         super().__init__(tokenizer)
 
-        self.tool_format = str(
-            (chat_template_kwargs or {}).get("tool_format") or "default"
-        )
+        chat_template_kwargs = chat_template_kwargs or {}
+        raw_tool_format = "xml"
+        for key in ("tool_call_format", "tool_calling_format", "tool_format"):
+            if key in chat_template_kwargs and chat_template_kwargs[key] is not None:
+                raw_tool_format = chat_template_kwargs[key]
+                break
+        self.tool_format = self._validate_tool_format(raw_tool_format)
         self._delegate: ToolParser | None = None
 
-        if self.tool_format == "default":
-            from vllm.entrypoints.openai.tool_parsers.hermes_tool_parser import (
-                Hermes2ProToolParser,
-            )
-
-            self._delegate = Hermes2ProToolParser(tokenizer)
-        elif self.tool_format == "qwen3":
+        if self.tool_format == "qwen3":
             from vllm.entrypoints.openai.tool_parsers.qwen3xml_tool_parser import (
                 Qwen3XMLToolParser,
             )
 
             self._delegate = Qwen3XMLToolParser(tokenizer)
+
+    @classmethod
+    def _validate_tool_format(cls, tool_format: Any) -> str:
+        if not isinstance(tool_format, str):
+            raise ValueError(
+                "tool_format/tool_call_format must be a string. "
+                f"Got {type(tool_format).__name__}."
+            )
+        if tool_format not in cls._SUPPORTED_TOOL_FORMATS:
+            supported_formats = ", ".join(sorted(cls._SUPPORTED_TOOL_FORMATS))
+            raise ValueError(
+                f"Unsupported tool_format/tool_call_format '{tool_format}'. "
+                "Use one of these exact values: "
+                f"{supported_formats}."
+            )
+        return tool_format
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
         if self._delegate is not None:
@@ -99,11 +141,17 @@ class MultiFormatToolParser(ToolParser):
             return self._delegate.extract_tool_calls(model_output, request)
 
         try:
+            if self.tool_format == "json":
+                return self._extract_ifm_json_tool_calls(model_output, request)
+            if self.tool_format in {"xml", "xml_typed"}:
+                return self._extract_ifm_xml_tool_calls(model_output, request)
             if self.tool_format == "minimax":
                 return self._extract_minimax_tool_calls(model_output)
             if self.tool_format == "dsv32":
                 return self._extract_dsv32_tool_calls(model_output)
             if self.tool_format == "glm":
+                if self._IFM_TOOL_CALL_START_TOKEN in model_output:
+                    return self._extract_ifm_xml_tool_calls(model_output, request)
                 return self._extract_glm_tool_calls(model_output, request)
             if self.tool_format == "gptoss":
                 return self._extract_gptoss_tool_calls(model_output)
@@ -166,6 +214,214 @@ class MultiFormatToolParser(ToolParser):
             function=FunctionCall(
                 name=function_name,
                 arguments=json.dumps(arguments, ensure_ascii=False),
+            ),
+        )
+
+    @staticmethod
+    def _schema_arg_type(
+        tool_name: str,
+        arg_name: str,
+        tools: list[ChatCompletionToolsParam] | None,
+    ) -> Any | None:
+        if tools is None:
+            return None
+        for tool in tools:
+            if tool.function.name != tool_name or tool.function.parameters is None:
+                continue
+            properties = tool.function.parameters.get("properties", {})
+            arg_spec = properties.get(arg_name, {})
+            if not isinstance(arg_spec, dict):
+                return None
+            return arg_spec.get("type")
+        return None
+
+    @staticmethod
+    def _arg_type_is_string(arg_type: Any | None) -> bool:
+        if isinstance(arg_type, str):
+            return arg_type == "string"
+        if isinstance(arg_type, list):
+            return "string" in arg_type
+        return False
+
+    @staticmethod
+    def _json_stringify(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False)
+
+    @classmethod
+    def _coerce_argument_value(
+        cls,
+        value: Any,
+        tool_name: str,
+        arg_name: str,
+        tools: list[ChatCompletionToolsParam] | None,
+        *,
+        arg_type: str | None = None,
+        from_text: bool = False,
+    ) -> Any:
+        target_type = cls._schema_arg_type(tool_name, arg_name, tools) or arg_type
+        if cls._arg_type_is_string(target_type):
+            return cls._json_stringify(value)
+
+        if isinstance(value, str) and (from_text or target_type is not None):
+            return cls._deserialize_glm_value(value)
+        return value
+
+    @classmethod
+    def _coerce_arguments(
+        cls,
+        tool_name: str,
+        arguments: dict[str, Any],
+        tools: list[ChatCompletionToolsParam] | None,
+    ) -> dict[str, Any]:
+        return {
+            arg_name: cls._coerce_argument_value(
+                arg_value,
+                tool_name,
+                arg_name,
+                tools,
+            )
+            for arg_name, arg_value in arguments.items()
+        }
+
+    @staticmethod
+    def _json_arguments_to_dict(arguments: Any) -> dict[str, Any]:
+        if arguments is None:
+            return {}
+        if isinstance(arguments, str):
+            arguments = json.loads(arguments) if arguments.strip() else {}
+        if not isinstance(arguments, dict):
+            raise ValueError("Tool call arguments must be a JSON object.")
+        return arguments
+
+    @classmethod
+    def _ifm_prefix_index(cls, model_output: str, first_match_index: int) -> int:
+        group_index = model_output.find(cls._IFM_TOOL_CALLS_START_TOKEN)
+        if group_index != -1:
+            return group_index
+        return first_match_index
+
+    def _extract_ifm_tool_calls(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest,
+    ) -> ExtractedToolCallInformation:
+        matches = list(self._IFM_BLOCK_REGEX.finditer(model_output))
+        if not matches:
+            return ExtractedToolCallInformation(
+                tools_called=False,
+                tool_calls=[],
+                content=model_output,
+            )
+
+        first_block = matches[0].group(1).strip()
+        if first_block.startswith(("{", "[")):
+            return self._extract_ifm_json_tool_calls(model_output, request)
+        return self._extract_ifm_xml_tool_calls(model_output, request)
+
+    def _extract_ifm_json_tool_calls(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest,
+    ) -> ExtractedToolCallInformation:
+        matches = list(self._IFM_BLOCK_REGEX.finditer(model_output))
+        if not matches:
+            return ExtractedToolCallInformation(
+                tools_called=False,
+                tool_calls=[],
+                content=model_output,
+            )
+
+        tool_calls: list[ToolCall] = []
+        for match in matches:
+            raw_tool_call = json.loads(match.group(1).strip())
+            raw_tool_calls = (
+                raw_tool_call if isinstance(raw_tool_call, list) else [raw_tool_call]
+            )
+            for tool_call in raw_tool_calls:
+                function = tool_call.get("function", tool_call)
+                function_name = function.get("name")
+                if not function_name:
+                    raise ValueError("Tool call JSON is missing a function name.")
+                arguments = self._json_arguments_to_dict(
+                    function.get("arguments", {})
+                )
+                arguments = self._coerce_arguments(
+                    function_name,
+                    arguments,
+                    request.tools,
+                )
+                tool_calls.append(self._tool_call(function_name, arguments))
+
+        if not tool_calls:
+            return ExtractedToolCallInformation(
+                tools_called=False,
+                tool_calls=[],
+                content=model_output,
+            )
+
+        return ExtractedToolCallInformation(
+            tools_called=True,
+            tool_calls=tool_calls,
+            content=self._prefix_content(
+                model_output,
+                self._ifm_prefix_index(model_output, matches[0].start()),
+            ),
+        )
+
+    def _extract_ifm_xml_tool_calls(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest,
+    ) -> ExtractedToolCallInformation:
+        matches = list(self._IFM_BLOCK_REGEX.finditer(model_output))
+        if not matches:
+            return ExtractedToolCallInformation(
+                tools_called=False,
+                tool_calls=[],
+                content=model_output,
+            )
+
+        tool_calls: list[ToolCall] = []
+        for match in matches:
+            block = match.group(1)
+            first_arg_idx = block.find("<ifm|arg_key>")
+            if first_arg_idx == -1:
+                function_name = block.strip()
+                arguments: dict[str, Any] = {}
+            else:
+                function_name = block[:first_arg_idx].strip()
+                arg_block = block[first_arg_idx:]
+                arguments = {}
+                for key, arg_type, value in self._IFM_ARG_REGEX.findall(arg_block):
+                    arg_key = key.strip()
+                    arg_value = self._coerce_argument_value(
+                        value.strip(),
+                        function_name,
+                        arg_key,
+                        request.tools,
+                        arg_type=arg_type.strip() or None,
+                        from_text=True,
+                    )
+                    arguments[arg_key] = arg_value
+
+            if function_name:
+                tool_calls.append(self._tool_call(function_name, arguments))
+
+        if not tool_calls:
+            return ExtractedToolCallInformation(
+                tools_called=False,
+                tool_calls=[],
+                content=model_output,
+            )
+
+        return ExtractedToolCallInformation(
+            tools_called=True,
+            tool_calls=tool_calls,
+            content=self._prefix_content(
+                model_output,
+                self._ifm_prefix_index(model_output, matches[0].start()),
             ),
         )
 
@@ -290,25 +546,6 @@ class MultiFormatToolParser(ToolParser):
 
         return value
 
-    @staticmethod
-    def _glm_value_is_string(
-        tool_name: str,
-        arg_name: str,
-        tools: list[ChatCompletionToolsParam] | None,
-    ) -> bool:
-        if tools is None:
-            return False
-        for tool in tools:
-            if tool.function.name != tool_name or tool.function.parameters is None:
-                continue
-            arg_type = (
-                tool.function.parameters.get("properties", {})
-                .get(arg_name, {})
-                .get("type")
-            )
-            return arg_type == "string"
-        return False
-
     def _extract_glm_tool_calls(
         self,
         model_output: str,
@@ -335,11 +572,13 @@ class MultiFormatToolParser(ToolParser):
                 arguments = {}
                 for key, value in self._GLM_ARG_REGEX.findall(arg_block):
                     arg_key = key.strip()
-                    arg_value = value.strip()
-                    if not self._glm_value_is_string(
-                        function_name, arg_key, request.tools
-                    ):
-                        arg_value = self._deserialize_glm_value(arg_value)
+                    arg_value = self._coerce_argument_value(
+                        value.strip(),
+                        function_name,
+                        arg_key,
+                        request.tools,
+                        from_text=True,
+                    )
                     arguments[arg_key] = arg_value
 
             if function_name:
@@ -448,3 +687,7 @@ class MultiFormatToolParser(ToolParser):
                 model_output.find("<tool_call>"),
             ),
         )
+
+
+class K2V3ToolParser(MultiFormatToolParser):
+    """K2-V3 alias for the IFM-aware multi-format parser."""

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from typing import Any
 
 import pytest
 
@@ -38,6 +39,13 @@ def make_parser(tool_format: str) -> ToolParser:
     )
 
 
+def make_parser_with_kwargs(chat_template_kwargs: dict[str, Any]) -> ToolParser:
+    return ToolParserManager.get_tool_parser("multi_format")(
+        FakeTokenizer(),
+        chat_template_kwargs=chat_template_kwargs,
+    )
+
+
 def make_request() -> ChatCompletionRequest:
     return ChatCompletionRequest(
         model="test-model",
@@ -45,12 +53,39 @@ def make_request() -> ChatCompletionRequest:
     )
 
 
-def test_default_format_delegates_to_hermes():
-    parser = make_parser("default")
+def make_schema_request() -> ChatCompletionRequest:
+    return ChatCompletionRequest(
+        model="test-model",
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "study_args",
+                    "description": "Study argument coercion.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "user_id": {"type": "string"},
+                            "include_revoked": {"type": "boolean"},
+                            "page": {"type": "integer"},
+                            "filters": {"type": "object"},
+                        },
+                    },
+                },
+            }
+        ],
+    )
+
+
+def test_missing_tool_format_defaults_to_xml():
+    parser = make_parser_with_kwargs({})
 
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        '<tool_call>\n{"name":"get_weather","arguments":{"city":"Tokyo"}}\n</tool_call>',
+        "<ifm|tool_call>get_weather"
+        "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
+        "</ifm|tool_call>",
         make_request(),
     )
 
@@ -90,6 +125,133 @@ def test_glm_format_matches_template_output():
     assert extracted.tool_calls[0].function.name == "get_weather"
     assert json.loads(extracted.tool_calls[0].function.arguments) == {
         "city": "Beijing"
+    }
+
+
+def test_ifm_json_format_uses_schema_type_coercion():
+    parser = make_parser_with_kwargs({"tool_call_format": "json"})
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        'Planning.\n<ifm|tool_calls>\n'
+        '<ifm|tool_call>{"name":"study_args","arguments":{'
+        '"user_id":12345,'
+        '"include_revoked":"true",'
+        '"page":"2",'
+        '"filters":"{\\"unit\\":\\"celsius\\"}"'
+        "}}</ifm|tool_call>\n"
+        "</ifm|tool_calls>",
+        make_schema_request(),
+    )
+
+    assert extracted.tools_called
+    assert extracted.content == "Planning.\n"
+    assert extracted.tool_calls[0].function.name == "study_args"
+    args = json.loads(extracted.tool_calls[0].function.arguments)
+    assert args == {
+        "user_id": "12345",
+        "include_revoked": True,
+        "page": 2,
+        "filters": {"unit": "celsius"},
+    }
+    assert isinstance(args["user_id"], str)
+
+
+def test_ifm_xml_format_uses_schema_type_coercion():
+    parser = make_parser("xml")
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        "Planning.\n<ifm|tool_calls>\n"
+        "<ifm|tool_call>study_args\n"
+        "<ifm|arg_key>user_id</ifm|arg_key>\n"
+        "<ifm|arg_value>12345</ifm|arg_value>\n"
+        "<ifm|arg_key>include_revoked</ifm|arg_key>\n"
+        "<ifm|arg_value>true</ifm|arg_value>\n"
+        "<ifm|arg_key>page</ifm|arg_key>\n"
+        "<ifm|arg_value>2</ifm|arg_value>\n"
+        "<ifm|arg_key>filters</ifm|arg_key>\n"
+        '<ifm|arg_value>{"unit":"celsius"}</ifm|arg_value>\n'
+        "</ifm|tool_call>\n"
+        "</ifm|tool_calls>",
+        make_schema_request(),
+    )
+
+    assert extracted.tools_called
+    args = json.loads(extracted.tool_calls[0].function.arguments)
+    assert args == {
+        "user_id": "12345",
+        "include_revoked": True,
+        "page": 2,
+        "filters": {"unit": "celsius"},
+    }
+    assert isinstance(args["user_id"], str)
+
+
+def test_ifm_xml_typed_format_uses_arg_type_without_schema():
+    parser = make_parser_with_kwargs({"tool_call_format": "xml_typed"})
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        "<ifm|tool_calls>\n"
+        "<ifm|tool_call>study_args\n"
+        "<ifm|arg_key>user_id</ifm|arg_key>\n"
+        "<ifm|arg_type>string</ifm|arg_type>\n"
+        "<ifm|arg_value>12345</ifm|arg_value>\n"
+        "<ifm|arg_key>include_revoked</ifm|arg_key>\n"
+        "<ifm|arg_type>boolean</ifm|arg_type>\n"
+        "<ifm|arg_value>true</ifm|arg_value>\n"
+        "<ifm|arg_key>page</ifm|arg_key>\n"
+        "<ifm|arg_type>integer</ifm|arg_type>\n"
+        "<ifm|arg_value>2</ifm|arg_value>\n"
+        "</ifm|tool_call>\n"
+        "</ifm|tool_calls>",
+        make_request(),
+    )
+
+    assert extracted.tools_called
+    args = json.loads(extracted.tool_calls[0].function.arguments)
+    assert args == {
+        "user_id": "12345",
+        "include_revoked": True,
+        "page": 2,
+    }
+    assert isinstance(args["user_id"], str)
+
+
+@pytest.mark.parametrize(
+    "tool_format",
+    ["default", "typed_xml", "XML", "xllm_typed", "xml ", ""],
+)
+def test_tool_format_requires_exact_supported_value(tool_format: str):
+    with pytest.raises(ValueError, match="Use one of these exact values"):
+        make_parser_with_kwargs({"tool_call_format": tool_format})
+
+
+def test_tool_format_must_be_a_string():
+    with pytest.raises(ValueError, match="must be a string"):
+        make_parser_with_kwargs({"tool_call_format": 123})
+
+
+def test_k2_v3_parser_alias_uses_ifm_formats():
+    parser = ToolParserManager.get_tool_parser("k2_v3")(
+        FakeTokenizer(),
+        chat_template_kwargs={"tool_call_format": "xml_typed"},
+    )
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        "<ifm|tool_call>study_args\n"
+        "<ifm|arg_key>user_id</ifm|arg_key>"
+        "<ifm|arg_type>string</ifm|arg_type>"
+        "<ifm|arg_value>12345</ifm|arg_value>"
+        "</ifm|tool_call>",
+        make_request(),
+    )
+
+    assert extracted.tools_called
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "user_id": "12345"
     }
 
 
@@ -260,13 +422,12 @@ def test_custom_formats_do_not_stream_yet():
     assert delta is None
 
 
-def test_readme_default_example():
-    parser = make_parser("default")
+def test_readme_json_example():
+    parser = make_parser("json")
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        '<tool_call>\n'
-        '{"name": "get_weather", "arguments": {"location": "San Francisco, CA"}}\n'
-        "</tool_call>",
+        '<ifm|tool_call>{"name": "get_weather", '
+        '"arguments": {"location": "San Francisco, CA"}}</ifm|tool_call>',
         make_request(),
     )
     assert extracted.tools_called
