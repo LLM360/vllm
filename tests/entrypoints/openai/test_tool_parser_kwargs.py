@@ -59,7 +59,7 @@ pytestmark = pytest.mark.cpu_test
 class KwargAwareToolParser(ToolParser):
     def __init__(self, tokenizer, chat_template_kwargs=None):
         super().__init__(tokenizer)
-        self.tool_format = (chat_template_kwargs or {}).get("tool_format")
+        self.tool_call_format = (chat_template_kwargs or {}).get("tool_call_format")
 
     def extract_tool_calls(self, model_output, request):
         return ExtractedToolCallInformation(
@@ -67,7 +67,7 @@ class KwargAwareToolParser(ToolParser):
             tool_calls=[
                 ToolCall(
                     function=FunctionCall(
-                        name=self.tool_format or "missing",
+                        name=self.tool_call_format or "missing",
                         arguments="{}",
                     )
                 )
@@ -148,7 +148,7 @@ def test_parse_tool_calls_from_content_passes_chat_template_kwargs():
         enable_auto_tools=True,
         tool_parser_cls=KwargAwareToolParser,
         content="<function_calls>noop()</function_calls>",
-        chat_template_kwargs={"tool_format": "python"},
+        chat_template_kwargs={"tool_call_format": "python"},
     )
 
     assert content is None
@@ -167,7 +167,7 @@ def test_parse_tool_calls_from_content_keeps_legacy_parsers_compatible():
         enable_auto_tools=True,
         tool_parser_cls=LegacyToolParser,
         content="<function_calls>noop()</function_calls>",
-        chat_template_kwargs={"tool_format": "python"},
+        chat_template_kwargs={"tool_call_format": "python"},
     )
 
     assert content is None

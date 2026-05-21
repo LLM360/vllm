@@ -32,10 +32,10 @@ class FakeTokenizer:
         return "".join(reverse_vocab[token_id] for token_id in token_ids)
 
 
-def make_parser(tool_format: str) -> ToolParser:
+def make_parser(tool_call_format: str) -> ToolParser:
     return ToolParserManager.get_tool_parser("multi_format")(
         FakeTokenizer(),
-        chat_template_kwargs={"tool_format": tool_format},
+        chat_template_kwargs={"tool_call_format": tool_call_format},
     )
 
 
@@ -78,7 +78,7 @@ def make_schema_request() -> ChatCompletionRequest:
     )
 
 
-def test_missing_tool_format_defaults_to_xml():
+def test_missing_tool_call_format_defaults_to_xml():
     parser = make_parser_with_kwargs({})
 
     extracted = run_tool_extraction_nonstreaming(
@@ -220,17 +220,23 @@ def test_ifm_xml_typed_format_uses_arg_type_without_schema():
 
 
 @pytest.mark.parametrize(
-    "tool_format",
+    "tool_call_format",
     ["default", "typed_xml", "XML", "xllm_typed", "xml ", ""],
 )
-def test_tool_format_requires_exact_supported_value(tool_format: str):
+def test_tool_call_format_requires_exact_supported_value(tool_call_format: str):
     with pytest.raises(ValueError, match="Use one of these exact values"):
-        make_parser_with_kwargs({"tool_call_format": tool_format})
+        make_parser_with_kwargs({"tool_call_format": tool_call_format})
 
 
-def test_tool_format_must_be_a_string():
+def test_tool_call_format_must_be_a_string():
     with pytest.raises(ValueError, match="must be a string"):
         make_parser_with_kwargs({"tool_call_format": 123})
+
+
+@pytest.mark.parametrize("arg_name", ["tool_format", "tool_calling_format"])
+def test_legacy_tool_format_arguments_are_rejected(arg_name: str):
+    with pytest.raises(ValueError, match=f"Unsupported argument: {arg_name}"):
+        make_parser_with_kwargs({arg_name: "xml"})
 
 
 def test_k2_v3_parser_alias_uses_ifm_formats():
@@ -253,6 +259,52 @@ def test_k2_v3_parser_alias_uses_ifm_formats():
     assert json.loads(extracted.tool_calls[0].function.arguments) == {
         "user_id": "12345"
     }
+
+
+def test_k2_v3_parser_strips_0518_ifm_reasoning_prefix():
+    parser = ToolParserManager.get_tool_parser("k2_v3")(
+        FakeTokenizer(),
+        chat_template_kwargs={"tool_call_format": "xml"},
+    )
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        "<ifm|think>need lookup</ifm|think>\n"
+        "<ifm|tool_calls>\n"
+        "<ifm|tool_call>get_weather"
+        "<ifm|arg_key>city</ifm|arg_key>"
+        "<ifm|arg_value>Tokyo</ifm|arg_value>"
+        "</ifm|tool_call>\n"
+        "</ifm|tool_calls>",
+        make_request(),
+    )
+
+    assert extracted.tools_called
+    assert extracted.content is None
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "Tokyo"}
+
+
+def test_k2_v3_parser_does_not_strip_legacy_reasoning_prefix():
+    parser = ToolParserManager.get_tool_parser("k2_v3")(
+        FakeTokenizer(),
+        chat_template_kwargs={"tool_call_format": "xml"},
+    )
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        "<think>legacy reasoning</think>\n"
+        "<ifm|tool_call>get_weather"
+        "<ifm|arg_key>city</ifm|arg_key>"
+        "<ifm|arg_value>Tokyo</ifm|arg_value>"
+        "</ifm|tool_call>",
+        make_request(),
+    )
+
+    assert extracted.tools_called
+    assert extracted.content == "<think>legacy reasoning</think>\n"
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "Tokyo"}
 
 
 def test_minimax_format_extracts_inline_invokes():

@@ -10,10 +10,10 @@ class K2V3ReasoningParser(DeepSeekR1ReasoningParser):
     Reasoning parser for the K2-v3 model family.
 
     K2-v3 supports three reasoning effort levels, each using different
-    think tokens:
-      - high (default): <think> / </think>
-      - medium:         <think_fast> / </think_fast>
-      - low:            <think_faster> / </think_faster>
+    IFM think tokens:
+      - high (default): <ifm|think> / </ifm|think>
+      - medium:         <ifm|think_fast> / </ifm|think_fast>
+      - low:            <ifm|think_faster> / </ifm|think_faster>
 
     The effort level is selected via the ``reasoning_effort`` parameter
     in ``chat_template_kwargs``.  The chat template inserts the start
@@ -22,9 +22,9 @@ class K2V3ReasoningParser(DeepSeekR1ReasoningParser):
     """
 
     _EFFORT_TOKENS: dict[str, tuple[str, str]] = {
-        "high": ("<think>", "</think>"),
-        "medium": ("<think_fast>", "</think_fast>"),
-        "low": ("<think_faster>", "</think_faster>"),
+        "high": ("<ifm|think>", "</ifm|think>"),
+        "medium": ("<ifm|think_fast>", "</ifm|think_fast>"),
+        "low": ("<ifm|think_faster>", "</ifm|think_faster>"),
     }
 
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):

@@ -9,9 +9,9 @@ from vllm.reasoning import ReasoningParser, ReasoningParserManager
 PARSER_NAME = "k2_v3"
 
 EFFORT_TOKENS = {
-    "high": ("<think>", "</think>"),
-    "medium": ("<think_fast>", "</think_fast>"),
-    "low": ("<think_faster>", "</think_faster>"),
+    "high": ("<ifm|think>", "</ifm|think>"),
+    "medium": ("<ifm|think_fast>", "</ifm|think_fast>"),
+    "low": ("<ifm|think_faster>", "</ifm|think_faster>"),
 }
 
 
@@ -190,21 +190,21 @@ def test_reasoning(
 
 
 def test_default_effort_is_high(k2_v3_tokenizer):
-    """Parser with no reasoning_effort should use <think>/<\/think>."""
+    """Parser with no reasoning_effort should use <ifm|think>/</ifm|think>."""
     parser = ReasoningParserManager.get_reasoning_parser(PARSER_NAME)(k2_v3_tokenizer)
-    assert parser.start_token == "<think>"
-    assert parser.end_token == "</think>"
+    assert parser.start_token == "<ifm|think>"
+    assert parser.end_token == "</ifm|think>"
 
 
 def test_none_effort_falls_back_to_high(k2_v3_tokenizer):
     """reasoning_effort='none' should fall back to high tokens."""
     parser = _make_parser(k2_v3_tokenizer, "none")
-    assert parser.start_token == "<think>"
-    assert parser.end_token == "</think>"
+    assert parser.start_token == "<ifm|think>"
+    assert parser.end_token == "</ifm|think>"
 
 
 def test_unknown_effort_falls_back_to_high(k2_v3_tokenizer):
     """Unknown effort value should fall back to high tokens."""
     parser = _make_parser(k2_v3_tokenizer, "ultra")
-    assert parser.start_token == "<think>"
-    assert parser.end_token == "</think>"
+    assert parser.start_token == "<ifm|think>"
+    assert parser.end_token == "</ifm|think>"

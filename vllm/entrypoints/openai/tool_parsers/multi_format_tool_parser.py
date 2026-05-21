@@ -78,6 +78,14 @@ class MultiFormatToolParser(ToolParser):
         r"<ifm\|arg_value>(.*?)</ifm\|arg_value>",
         re.DOTALL,
     )
+    _IFM_REASONING_PREFIX_REGEX = re.compile(
+        r"\A\s*(?:"
+        r"<ifm\|think>.*?</ifm\|think>|"
+        r"<ifm\|think_fast>.*?</ifm\|think_fast>|"
+        r"<ifm\|think_faster>.*?</ifm\|think_faster>"
+        r")\s*",
+        re.DOTALL,
+    )
 
     _GLM_BLOCK_REGEX = re.compile(
         r"<tool_call>(.*?)</tool_call>",
@@ -96,11 +104,17 @@ class MultiFormatToolParser(ToolParser):
         super().__init__(tokenizer)
 
         chat_template_kwargs = chat_template_kwargs or {}
-        raw_tool_format = "xml"
-        for key in ("tool_call_format", "tool_calling_format", "tool_format"):
-            if key in chat_template_kwargs and chat_template_kwargs[key] is not None:
-                raw_tool_format = chat_template_kwargs[key]
-                break
+        if "tool_calling_format" in chat_template_kwargs:
+            raise ValueError(
+                "Unsupported argument: tool_calling_format. "
+                "Use tool_call_format with one of: json, xml, xml_typed."
+            )
+        if "tool_format" in chat_template_kwargs:
+            raise ValueError(
+                "Unsupported argument: tool_format. "
+                "Use tool_call_format with one of: json, xml, xml_typed."
+            )
+        raw_tool_format = chat_template_kwargs.get("tool_call_format", "xml")
         self.tool_format = self._validate_tool_format(raw_tool_format)
         self._delegate: ToolParser | None = None
 
@@ -115,13 +129,13 @@ class MultiFormatToolParser(ToolParser):
     def _validate_tool_format(cls, tool_format: Any) -> str:
         if not isinstance(tool_format, str):
             raise ValueError(
-                "tool_format/tool_call_format must be a string. "
+                "tool_call_format must be a string. "
                 f"Got {type(tool_format).__name__}."
             )
         if tool_format not in cls._SUPPORTED_TOOL_FORMATS:
             supported_formats = ", ".join(sorted(cls._SUPPORTED_TOOL_FORMATS))
             raise ValueError(
-                f"Unsupported tool_format/tool_call_format '{tool_format}'. "
+                f"Unsupported tool_call_format '{tool_format}'. "
                 "Use one of these exact values: "
                 f"{supported_formats}."
             )
@@ -159,7 +173,7 @@ class MultiFormatToolParser(ToolParser):
                 return self._extract_python_tool_calls(model_output)
         except Exception:
             logger.exception(
-                "Error extracting tool calls for tool_format=%s.",
+                "Error extracting tool calls for tool_call_format=%s.",
                 self.tool_format,
             )
 
@@ -200,11 +214,21 @@ class MultiFormatToolParser(ToolParser):
         except json.JSONDecodeError:
             return value
 
-    @staticmethod
-    def _prefix_content(model_output: str, first_tool_index: int | None) -> str | None:
+    @classmethod
+    def _strip_ifm_reasoning_prefix(cls, content: str) -> str:
+        while match := cls._IFM_REASONING_PREFIX_REGEX.match(content):
+            content = content[match.end() :]
+        return content
+
+    @classmethod
+    def _prefix_content(
+        cls,
+        model_output: str,
+        first_tool_index: int | None,
+    ) -> str | None:
         if first_tool_index is None or first_tool_index <= 0:
             return None
-        content = model_output[:first_tool_index]
+        content = cls._strip_ifm_reasoning_prefix(model_output[:first_tool_index])
         return content if content.strip() else None
 
     @staticmethod
@@ -690,4 +714,4 @@ class MultiFormatToolParser(ToolParser):
 
 
 class K2V3ToolParser(MultiFormatToolParser):
-    """K2-V3 alias for the IFM-aware multi-format parser."""
+    """K2-V3 parser for BBQ 0518 IFM tool-call and reasoning tokens."""
