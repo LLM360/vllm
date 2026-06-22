@@ -2301,6 +2301,33 @@ def test_parse_chat_messages_include_thinking_chunk(
     assert conversation_with_thinking == expected_conversation
 
 
+@pytest.mark.parametrize(
+    "reasoning_key",
+    ["reasoning", "reasoning_content", "think", "think_fast", "think_faster"],
+)
+@pytest.mark.parametrize("reasoning_value", ["", "scratchpad"])
+def test_parse_chat_messages_preserves_reasoning_aliases(
+    reasoning_key, reasoning_value, mistral_model_config, mistral_tokenizer
+):
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "4", reasoning_key: reasoning_value},
+    ]
+
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        mistral_model_config,
+        mistral_tokenizer,
+        content_format="openai",
+    )
+
+    assert conversation[1]["reasoning"] == reasoning_value
+    assert conversation[1]["reasoning_content"] == reasoning_value
+    assert conversation[1]["think"] == reasoning_value
+    assert conversation[1]["think_fast"] == reasoning_value
+    assert conversation[1]["think_faster"] == reasoning_value
+
+
 def test_apply_mistral_chat_template_thinking_chunk():
     messages = [
         {
