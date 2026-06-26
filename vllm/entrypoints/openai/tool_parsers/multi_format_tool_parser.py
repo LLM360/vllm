@@ -8,10 +8,13 @@ from typing import Any
 
 import regex as re
 
+from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionToolsParam,
+    DeltaFunctionCall,
     DeltaMessage,
+    DeltaToolCall,
     ExtractedToolCallInformation,
     FunctionCall,
     ToolCall,
@@ -117,6 +120,9 @@ class MultiFormatToolParser(ToolParser):
         raw_tool_format = chat_template_kwargs.get("tool_call_format", "xml")
         self.tool_format = self._validate_tool_format(raw_tool_format)
         self._delegate: ToolParser | None = None
+        self._streaming_tool_call_started = False
+        self._streaming_content_buffer = ""
+        self._streaming_tool_calls_emitted = False
 
         if self.tool_format == "qwen3":
             from vllm.entrypoints.openai.tool_parsers.qwen3xml_tool_parser import (
@@ -204,7 +210,95 @@ class MultiFormatToolParser(ToolParser):
                 request,
             )
 
+        return self._extract_tool_calls_streaming_fallback(delta_text, request)
+
+    @classmethod
+    def _tool_call_markers(cls) -> tuple[str, ...]:
+        return (
+            cls._IFM_TOOL_CALLS_START_TOKEN,
+            cls._IFM_TOOL_CALL_START_TOKEN,
+            cls._MINIMAX_START_TOKEN,
+            "<tool_call>",
+        )
+
+    @classmethod
+    def _partial_tool_call_marker_start(cls, text: str) -> int | None:
+        markers = cls._tool_call_markers()
+        max_marker_len = max(len(marker) for marker in markers)
+        start = max(0, len(text) - max_marker_len + 1)
+        for index in range(start, len(text)):
+            suffix = text[index:]
+            if any(marker.startswith(suffix) for marker in markers):
+                return index
         return None
+
+    @staticmethod
+    def _delta_tool_call(index: int, tool_call: ToolCall) -> DeltaToolCall:
+        return DeltaToolCall(
+            index=index,
+            id=tool_call.id or make_tool_call_id(),
+            type="function",
+            function=DeltaFunctionCall(
+                name=tool_call.function.name,
+                arguments=tool_call.function.arguments,
+            ).model_dump(exclude_none=True),
+        )
+
+    def _try_emit_streaming_tool_calls(
+        self, request: ChatCompletionRequest
+    ) -> DeltaMessage | None:
+        if self._streaming_tool_calls_emitted:
+            return None
+
+        parsed = self.extract_tool_calls(self._streaming_content_buffer, request)
+        if not parsed.tools_called or not parsed.tool_calls:
+            return None
+
+        self._streaming_tool_calls_emitted = True
+        self.prev_tool_call_arr = []
+        self.streamed_args_for_tool = []
+        tool_call_deltas: list[DeltaToolCall] = []
+        for index, tool_call in enumerate(parsed.tool_calls):
+            arguments = tool_call.function.arguments
+            self.prev_tool_call_arr.append(
+                {"name": tool_call.function.name, "arguments": arguments}
+            )
+            self.streamed_args_for_tool.append(arguments)
+            tool_call_deltas.append(self._delta_tool_call(index, tool_call))
+
+        self._streaming_content_buffer = ""
+        return DeltaMessage(tool_calls=tool_call_deltas)
+
+    def _extract_tool_calls_streaming_fallback(
+        self, delta_text: str, request: ChatCompletionRequest
+    ) -> DeltaMessage | None:
+        self._streaming_content_buffer += delta_text
+
+        if self._streaming_tool_call_started:
+            return self._try_emit_streaming_tool_calls(request)
+
+        buffer = self._streaming_content_buffer
+        markers = self._tool_call_markers()
+        marker_positions = [
+            pos for marker in markers if (pos := buffer.find(marker)) != -1
+        ]
+        if marker_positions:
+            first_marker_pos = min(marker_positions)
+            self._streaming_tool_call_started = True
+            content = buffer[:first_marker_pos]
+            self._streaming_content_buffer = buffer[first_marker_pos:]
+            if content:
+                return DeltaMessage(content=content)
+            return self._try_emit_streaming_tool_calls(request)
+
+        partial_start = self._partial_tool_call_marker_start(buffer)
+        if partial_start is not None:
+            content = buffer[:partial_start]
+            self._streaming_content_buffer = buffer[partial_start:]
+            return DeltaMessage(content=content) if content else None
+
+        self._streaming_content_buffer = ""
+        return DeltaMessage(content=buffer) if buffer else None
 
     @staticmethod
     def _json_or_string(value: str) -> Any:
