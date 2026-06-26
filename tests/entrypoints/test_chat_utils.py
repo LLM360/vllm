@@ -2301,6 +2301,103 @@ def test_parse_chat_messages_include_thinking_chunk(
     assert conversation_with_thinking == expected_conversation
 
 
+@pytest.mark.parametrize(
+    "reasoning_key",
+    ["reasoning", "reasoning_content", "think", "think_fast", "think_faster"],
+)
+@pytest.mark.parametrize("reasoning_value", ["", "scratchpad"])
+def test_parse_chat_messages_preserves_single_reasoning_alias(
+    reasoning_key, reasoning_value, mistral_model_config, mistral_tokenizer
+):
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "4", reasoning_key: reasoning_value},
+    ]
+
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        mistral_model_config,
+        mistral_tokenizer,
+        content_format="openai",
+    )
+
+    reasoning_keys = {
+        "reasoning",
+        "reasoning_content",
+        "think",
+        "think_fast",
+        "think_faster",
+    }
+    assert conversation[1][reasoning_key] == reasoning_value
+    assert not (reasoning_keys - {reasoning_key}) & conversation[1].keys()
+
+
+@pytest.mark.parametrize(
+    ("reasoning_fields", "expected_key"),
+    [
+        (
+            {
+                "think": "think",
+                "think_fast": "think_fast",
+                "think_faster": "think_faster",
+                "reasoning_content": "reasoning_content",
+                "reasoning": "reasoning",
+            },
+            "think",
+        ),
+        (
+            {
+                "think_fast": "think_fast",
+                "think_faster": "think_faster",
+                "reasoning_content": "reasoning_content",
+                "reasoning": "reasoning",
+            },
+            "think_fast",
+        ),
+        (
+            {
+                "think_faster": "think_faster",
+                "reasoning_content": "reasoning_content",
+                "reasoning": "reasoning",
+            },
+            "think_faster",
+        ),
+        (
+            {
+                "reasoning_content": "reasoning_content",
+                "reasoning": "reasoning",
+            },
+            "reasoning_content",
+        ),
+        ({"reasoning": "reasoning"}, "reasoning"),
+    ],
+)
+def test_parse_chat_messages_uses_reasoning_alias_priority(
+    reasoning_fields, expected_key, mistral_model_config, mistral_tokenizer
+):
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "4", **reasoning_fields},
+    ]
+
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        mistral_model_config,
+        mistral_tokenizer,
+        content_format="openai",
+    )
+
+    reasoning_keys = {
+        "reasoning",
+        "reasoning_content",
+        "think",
+        "think_fast",
+        "think_faster",
+    }
+    assert conversation[1][expected_key] == reasoning_fields[expected_key]
+    assert not (reasoning_keys - {expected_key}) & conversation[1].keys()
+
+
 def test_apply_mistral_chat_template_thinking_chunk():
     messages = [
         {
