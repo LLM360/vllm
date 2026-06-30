@@ -229,7 +229,7 @@ class MultiFormatToolParser(ToolParser):
         if first_tool_index is None or first_tool_index <= 0:
             return None
         content = cls._strip_ifm_reasoning_prefix(model_output[:first_tool_index])
-        return content if content.strip() else None
+        return content if content else None
 
     @staticmethod
     def _tool_call(function_name: str, arguments: dict[str, Any]) -> ToolCall:

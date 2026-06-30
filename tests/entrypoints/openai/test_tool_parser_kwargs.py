@@ -119,6 +119,37 @@ class LegacyToolParser(ToolParser):
         return None
 
 
+class WhitespaceContentToolParser(ToolParser):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+
+    def extract_tool_calls(self, model_output, request):
+        return ExtractedToolCallInformation(
+            tools_called=True,
+            tool_calls=[
+                ToolCall(
+                    function=FunctionCall(
+                        name="whitespace",
+                        arguments="{}",
+                    )
+                )
+            ],
+            content="\n",
+        )
+
+    def extract_tool_calls_streaming(
+        self,
+        previous_text,
+        current_text,
+        delta_text,
+        previous_token_ids,
+        current_token_ids,
+        delta_token_ids,
+        request,
+    ):
+        return None
+
+
 def make_request() -> ChatCompletionRequest:
     return ChatCompletionRequest(
         model="test-model",
@@ -174,4 +205,22 @@ def test_parse_tool_calls_from_content_keeps_legacy_parsers_compatible():
     assert function_calls is not None
     assert len(function_calls) == 1
     assert function_calls[0].name == "legacy"
+    assert function_calls[0].arguments == "{}"
+
+
+def test_parse_tool_calls_from_content_preserves_whitespace_content():
+    request = make_request()
+
+    function_calls, content = OpenAIServing._parse_tool_calls_from_content(
+        request=request,
+        tokenizer=MagicMock(),
+        enable_auto_tools=True,
+        tool_parser_cls=WhitespaceContentToolParser,
+        content="<function_calls>noop()</function_calls>",
+    )
+
+    assert content == "\n"
+    assert function_calls is not None
+    assert len(function_calls) == 1
+    assert function_calls[0].name == "whitespace"
     assert function_calls[0].arguments == "{}"

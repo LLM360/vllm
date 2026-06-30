@@ -1478,7 +1478,7 @@ class OpenAIServing:
                     for tool_call in tool_call_info.tool_calls
                 )
                 content = tool_call_info.content
-                if content and content.strip() == "":
+                if content == "":
                     content = None
             else:
                 # No tool calls.

@@ -285,6 +285,31 @@ def test_k2_v3_parser_strips_0518_ifm_reasoning_prefix():
     assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "Tokyo"}
 
 
+def test_k2_v3_parser_preserves_newline_before_tool_calls():
+    parser = ToolParserManager.get_tool_parser("k2_v3")(
+        FakeTokenizer(),
+        chat_template_kwargs={"tool_call_format": "xml_typed"},
+    )
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        "\n"
+        "<ifm|tool_calls>\n"
+        "<ifm|tool_call>get_weather\n"
+        "<ifm|arg_key>city</ifm|arg_key>\n"
+        "<ifm|arg_type>any</ifm|arg_type>\n"
+        "<ifm|arg_value>Tokyo</ifm|arg_value>\n"
+        "</ifm|tool_call>\n"
+        "</ifm|tool_calls>",
+        make_request(),
+    )
+
+    assert extracted.tools_called
+    assert extracted.content == "\n"
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "Tokyo"}
+
+
 def test_k2_v3_parser_does_not_strip_legacy_reasoning_prefix():
     parser = ToolParserManager.get_tool_parser("k2_v3")(
         FakeTokenizer(),
