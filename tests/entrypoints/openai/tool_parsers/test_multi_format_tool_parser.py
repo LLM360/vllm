@@ -188,6 +188,30 @@ def test_ifm_xml_format_uses_schema_type_coercion():
     assert isinstance(args["user_id"], str)
 
 
+def test_ifm_xml_format_preserves_schema_string_values_exactly():
+    parser = make_parser("xml")
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        "<ifm|tool_calls>\n"
+        "<ifm|tool_call>study_args\n"
+        "<ifm|arg_key>user_id</ifm|arg_key>\n"
+        "<ifm|arg_value>\n  12345  \n</ifm|arg_value>\n"
+        "<ifm|arg_key>filters</ifm|arg_key>\n"
+        '<ifm|arg_value>\n{"unit":"celsius"}\n</ifm|arg_value>\n'
+        "</ifm|tool_call>\n"
+        "</ifm|tool_calls>",
+        make_schema_request(),
+    )
+
+    assert extracted.tools_called
+    args = json.loads(extracted.tool_calls[0].function.arguments)
+    assert args == {
+        "user_id": "\n  12345  \n",
+        "filters": {"unit": "celsius"},
+    }
+
+
 def test_ifm_xml_typed_format_uses_arg_type_without_schema():
     parser = make_parser_with_kwargs({"tool_call_format": "xml_typed"})
 
@@ -217,6 +241,36 @@ def test_ifm_xml_typed_format_uses_arg_type_without_schema():
         "page": 2,
     }
     assert isinstance(args["user_id"], str)
+
+
+def test_ifm_xml_typed_preserves_string_and_any_values_exactly():
+    parser = make_parser_with_kwargs({"tool_call_format": "xml_typed"})
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        "<ifm|tool_calls>\n"
+        "<ifm|tool_call>study_args\n"
+        "<ifm|arg_key>user_id</ifm|arg_key>\n"
+        "<ifm|arg_type>string</ifm|arg_type>\n"
+        "<ifm|arg_value>\n  first line\nsecond line  \n</ifm|arg_value>\n"
+        "<ifm|arg_key>filters</ifm|arg_key>\n"
+        "<ifm|arg_type>object</ifm|arg_type>\n"
+        '<ifm|arg_value>\n{"unit":"celsius"}\n</ifm|arg_value>\n'
+        "<ifm|arg_key>loose</ifm|arg_key>\n"
+        "<ifm|arg_type>any</ifm|arg_type>\n"
+        '<ifm|arg_value>\n{"looks":"json"}\n</ifm|arg_value>\n'
+        "</ifm|tool_call>\n"
+        "</ifm|tool_calls>",
+        make_request(),
+    )
+
+    assert extracted.tools_called
+    args = json.loads(extracted.tool_calls[0].function.arguments)
+    assert args == {
+        "user_id": "\n  first line\nsecond line  \n",
+        "filters": {"unit": "celsius"},
+        "loose": '\n{"looks":"json"}\n',
+    }
 
 
 @pytest.mark.parametrize(
