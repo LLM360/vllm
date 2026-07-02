@@ -287,6 +287,8 @@ class MultiFormatToolParser(ToolParser):
         target_type = cls._schema_arg_type(tool_name, arg_name, tools) or arg_type
         if cls._arg_type_is_string(target_type):
             return cls._json_stringify(value)
+        if target_type == "any" and from_text:
+            return value
 
         if isinstance(value, str) and (from_text or target_type is not None):
             return cls._deserialize_glm_value(value)
@@ -420,12 +422,25 @@ class MultiFormatToolParser(ToolParser):
                 arguments = {}
                 for key, arg_type, value in self._IFM_ARG_REGEX.findall(arg_block):
                     arg_key = key.strip()
-                    arg_value = self._coerce_argument_value(
-                        value.strip(),
+                    explicit_arg_type = arg_type.strip() or None
+                    schema_arg_type = self._schema_arg_type(
                         function_name,
                         arg_key,
                         request.tools,
-                        arg_type=arg_type.strip() or None,
+                    )
+                    target_type = schema_arg_type or explicit_arg_type
+                    value_for_coercion = (
+                        value
+                        if self._arg_type_is_string(target_type)
+                        or target_type == "any"
+                        else value.strip()
+                    )
+                    arg_value = self._coerce_argument_value(
+                        value_for_coercion,
+                        function_name,
+                        arg_key,
+                        request.tools,
+                        arg_type=explicit_arg_type,
                         from_text=True,
                     )
                     arguments[arg_key] = arg_value
