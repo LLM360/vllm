@@ -367,6 +367,32 @@ class TestBaseThinkingReasoningParserStreaming:
         assert reasoning == "Reasoning content"
         assert content == "Final"
 
+    def test_streaming_boundary_delta_with_reasoning_and_content(self, test_tokenizer):
+        parser = TestThinkingReasoningParser(test_tokenizer)
+
+        deltas = [
+            "<test:think>",
+            "Reasoning content</test:think>Final",
+        ]
+
+        reasoning, content = run_reasoning_extraction(parser, deltas, streaming=True)
+
+        assert reasoning == "Reasoning content"
+        assert content == "Final"
+
+    def test_streaming_boundary_delta_with_empty_reasoning(self, test_tokenizer):
+        parser = TestThinkingReasoningParser(test_tokenizer)
+
+        deltas = [
+            "<test:think>",
+            "</test:think>Final",
+        ]
+
+        reasoning, content = run_reasoning_extraction(parser, deltas, streaming=True)
+
+        assert reasoning == ""
+        assert content == "Final"
+
 
 class TestBaseThinkingReasoningParserMultipleImplementations:
     """

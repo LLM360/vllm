@@ -13,10 +13,16 @@ os.environ[_STRICT_TOOL_CALLING_ENV] = "0"
 from vllm.entrypoints.openai.chat_completion.protocol import (  # noqa: E402
     ChatCompletionRequest,
 )
+from vllm.entrypoints.openai.engine.protocol import (  # noqa: E402
+    ExtractedToolCallInformation,
+    FunctionCall,
+    ToolCall,
+)
 from vllm.parser.abstract_parser import DelegatingParser  # noqa: E402
 from vllm.reasoning.basic_parsers import (  # noqa: E402
     BaseThinkingReasoningParser,
 )
+from vllm.tool_parsers.abstract_tool_parser import ToolParser  # noqa: E402
 from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser  # noqa: E402
 
 
@@ -88,6 +94,70 @@ def make_parser(tokenizer, reasoning=False, tool=False):
         tool_parser_cls = Hermes2ProToolParser if tool else None
 
     return TestParser(tokenizer)
+
+
+class KwargAwareToolParser(ToolParser):
+    def __init__(self, tokenizer, tools=None, chat_template_kwargs=None):
+        super().__init__(tokenizer, tools)
+        self.chat_template_kwargs = chat_template_kwargs
+
+
+class LegacyToolParser(ToolParser):
+    def __init__(self, tokenizer, tools=None):
+        super().__init__(tokenizer, tools)
+
+
+class WhitespaceContentToolParser(ToolParser):
+    def extract_tool_calls(self, model_output, request):
+        return ExtractedToolCallInformation(
+            tools_called=True,
+            tool_calls=[
+                ToolCall(function=FunctionCall(name="whitespace", arguments="{}"))
+            ],
+            content="\n",
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_delegating_parser_passes_chat_template_kwargs_to_tool_parser():
+    class TestParser(DelegatingParser):
+        tool_parser_cls = KwargAwareToolParser
+
+    parser = TestParser(object(), chat_template_kwargs={"tool_call_format": "python"})
+
+    assert isinstance(parser.tool_parser, KwargAwareToolParser)
+    assert parser.tool_parser.chat_template_kwargs == {"tool_call_format": "python"}
+
+
+@pytest.mark.skip_global_cleanup
+def test_delegating_parser_keeps_legacy_tool_parser_compatible():
+    class TestParser(DelegatingParser):
+        tool_parser_cls = LegacyToolParser
+
+    parser = TestParser(object(), chat_template_kwargs={"tool_call_format": "python"})
+
+    assert isinstance(parser.tool_parser, LegacyToolParser)
+
+
+@pytest.mark.skip_global_cleanup
+def test_delegating_parser_preserves_whitespace_tool_content():
+    class TestParser(DelegatingParser):
+        tool_parser_cls = WhitespaceContentToolParser
+
+    request = make_request(
+        tools=TOOLS,
+        tool_choice="auto",
+    )
+    parser = TestParser(object(), TOOLS)
+
+    tool_calls, content = parser._extract_tool_calls(
+        "ignored", request, enable_auto_tools=True
+    )
+
+    assert content == "\n"
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].name == "whitespace"
 
 
 @pytest.mark.parametrize(

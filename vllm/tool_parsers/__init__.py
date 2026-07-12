@@ -102,6 +102,10 @@ _TOOL_PARSERS_TO_REGISTER = {
         "kimi_k2_tool_parser",
         "KimiK2ToolParser",
     ),
+    "k2_v3": (
+        "multi_format_tool_parser",
+        "K2V3ToolParser",
+    ),
     "llama3_json": (
         "llama_tool_parser",
         "Llama3JsonToolParser",
@@ -129,6 +133,10 @@ _TOOL_PARSERS_TO_REGISTER = {
     "minimax_m3": (
         "minimax_m3_tool_parser",
         "MinimaxM3ToolParser",
+    ),
+    "multi_format": (
+        "multi_format_tool_parser",
+        "MultiFormatToolParser",
     ),
     "minicpm5": (
         "minicpm5xml_tool_parser",

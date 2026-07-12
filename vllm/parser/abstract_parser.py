@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import inspect
 import json
 from abc import abstractmethod
 from collections.abc import Sequence
@@ -118,13 +119,38 @@ class Parser:
                 tokenizer, *args, **kwargs
             )
         if self.__class__.tool_parser_cls is not None:
-            self._tool_parser = self.__class__.tool_parser_cls(tokenizer, tools)
+            tool_parser_cls = self.__class__.tool_parser_cls
+            tool_parser_kwargs = self._get_tool_parser_init_kwargs(
+                tool_parser_cls, kwargs.get("chat_template_kwargs")
+            )
+            self._tool_parser = tool_parser_cls(tokenizer, tools, **tool_parser_kwargs)
 
         self._engine_based = (
             self._reasoning_parser is None
             or self._reasoning_parser.engine_based_streaming
         ) and (self._tool_parser is None or self._tool_parser.engine_based_streaming)
         self._stream_state = StreamState(engine_based=self._engine_based)
+
+    @staticmethod
+    def _get_tool_parser_init_kwargs(
+        tool_parser_cls: type[ToolParser],
+        chat_template_kwargs: dict | None,
+    ) -> dict:
+        if not chat_template_kwargs:
+            return {}
+
+        try:
+            init_signature = inspect.signature(tool_parser_cls.__init__)
+        except (TypeError, ValueError):
+            return {}
+
+        if "chat_template_kwargs" in init_signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in init_signature.parameters.values()
+        ):
+            return {"chat_template_kwargs": chat_template_kwargs}
+
+        return {}
 
     @cached_property
     def vocab(self) -> dict[str, int]:
@@ -444,7 +470,7 @@ class DelegatingParser(Parser):
                     for tc in tool_call_info.tool_calls
                 )
                 content = tool_call_info.content
-                if content and content.strip() == "":
+                if content == "":
                     content = None
             else:
                 # No tool calls.

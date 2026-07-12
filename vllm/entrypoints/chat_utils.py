@@ -345,6 +345,18 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     reasoning: str | None
     """The reasoning content for interleaved thinking."""
 
+    reasoning_content: str | None
+    """Deprecated: The reasoning content for interleaved thinking."""
+
+    think: str | None
+    """The reasoning content for high-effort K2 thinking."""
+
+    think_fast: str | None
+    """The reasoning content for medium-effort K2 thinking."""
+
+    think_faster: str | None
+    """The reasoning content for low-effort K2 thinking."""
+
     tools: list[ChatCompletionFunctionToolParam] | None
     """The tools for developer role."""
 
@@ -381,6 +393,15 @@ class ConversationMessage(TypedDict, total=False):
 
     reasoning_content: str | None
     """Deprecated: The reasoning content for interleaved thinking."""
+
+    think: str | None
+    """The reasoning content for high-effort K2 thinking."""
+
+    think_fast: str | None
+    """The reasoning content for medium-effort K2 thinking."""
+
+    think_faster: str | None
+    """The reasoning content for low-effort K2 thinking."""
 
     tools: list[ChatCompletionFunctionToolParam] | None
     """The tools for developer role."""
@@ -1739,6 +1760,38 @@ def _parse_chat_message_content_part(
 _AssistantParser = partial(cast, ChatCompletionAssistantMessageParam)
 _ToolParser = partial(cast, ChatCompletionToolMessageParam)
 
+_ReasoningContentKey: TypeAlias = Literal[
+    "think",
+    "think_fast",
+    "think_faster",
+    "reasoning_content",
+    "reasoning",
+]
+
+_REASONING_CONTENT_KEYS: tuple[_ReasoningContentKey, ...] = (
+    "think",
+    "think_fast",
+    "think_faster",
+    "reasoning_content",
+    "reasoning",
+)
+
+
+def _get_reasoning_content(message: ChatCompletionMessageParam) -> str | None:
+    for key in _REASONING_CONTENT_KEYS:
+        if message.get(key) is not None:
+            return cast(str, message[key])
+    return None
+
+
+def _get_reasoning_content_key(
+    message: ChatCompletionMessageParam,
+) -> _ReasoningContentKey | None:
+    for key in _REASONING_CONTENT_KEYS:
+        if message.get(key) is not None:
+            return key
+    return None
+
 
 def _parse_chat_message_content(
     message: ChatCompletionMessageParam,
@@ -1749,7 +1802,8 @@ def _parse_chat_message_content(
 ) -> list[ConversationMessage]:
     role = message["role"]
     content = message.get("content")
-    reasoning = message.get("reasoning")
+    reasoning = _get_reasoning_content(message)
+    reasoning_key = _get_reasoning_content_key(message)
 
     if content is None:
         content = []
@@ -1774,11 +1828,8 @@ def _parse_chat_message_content(
             if "tool_calls" in parsed_msg and parsed_msg["tool_calls"] is not None:
                 result_msg["tool_calls"] = list(parsed_msg["tool_calls"])
             # Include reasoning if present for interleaved thinking.
-            if reasoning is not None:
-                result_msg["reasoning"] = cast(str, reasoning)
-                result_msg["reasoning_content"] = cast(
-                    str, reasoning
-                )  # keep compatibility
+            if reasoning is not None and reasoning_key is not None:
+                result_msg[reasoning_key] = reasoning
         elif role == "tool":
             parsed_msg = _ToolParser(message)
             if "tool_call_id" in parsed_msg:

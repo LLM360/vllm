@@ -3,6 +3,7 @@
 
 import warnings
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
@@ -2742,3 +2743,112 @@ def test_postprocess_messages_null_arguments_string():
     tool_calls = messages[0]["tool_calls"]
     assert tool_calls is not None
     assert tool_calls[0]["function"]["arguments"] == {}
+
+
+@pytest.fixture
+def text_only_model_config():
+    return SimpleNamespace(
+        allowed_local_media_path="",
+        allowed_media_domains=None,
+        enable_prompt_embeds=False,
+        hf_config=SimpleNamespace(),
+        is_multimodal_model=False,
+        multimodal_config=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "reasoning_key",
+    ["reasoning", "reasoning_content", "think", "think_fast", "think_faster"],
+)
+@pytest.mark.parametrize("reasoning_value", ["", "scratchpad"])
+@pytest.mark.skip_global_cleanup
+def test_parse_chat_messages_preserves_single_reasoning_alias(
+    reasoning_key, reasoning_value, text_only_model_config
+):
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "4", reasoning_key: reasoning_value},
+    ]
+
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        text_only_model_config,
+        content_format="openai",
+    )
+
+    reasoning_keys = {
+        "reasoning",
+        "reasoning_content",
+        "think",
+        "think_fast",
+        "think_faster",
+    }
+    assert conversation[1][reasoning_key] == reasoning_value
+    assert not (reasoning_keys - {reasoning_key}) & conversation[1].keys()
+
+
+@pytest.mark.parametrize(
+    ("reasoning_fields", "expected_key"),
+    [
+        (
+            {
+                "think": "think",
+                "think_fast": "think_fast",
+                "think_faster": "think_faster",
+                "reasoning_content": "reasoning_content",
+                "reasoning": "reasoning",
+            },
+            "think",
+        ),
+        (
+            {
+                "think_fast": "think_fast",
+                "think_faster": "think_faster",
+                "reasoning_content": "reasoning_content",
+                "reasoning": "reasoning",
+            },
+            "think_fast",
+        ),
+        (
+            {
+                "think_faster": "think_faster",
+                "reasoning_content": "reasoning_content",
+                "reasoning": "reasoning",
+            },
+            "think_faster",
+        ),
+        (
+            {
+                "reasoning_content": "reasoning_content",
+                "reasoning": "reasoning",
+            },
+            "reasoning_content",
+        ),
+        ({"reasoning": "reasoning"}, "reasoning"),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_parse_chat_messages_uses_reasoning_alias_priority(
+    reasoning_fields, expected_key, text_only_model_config
+):
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "4", **reasoning_fields},
+    ]
+
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        text_only_model_config,
+        content_format="openai",
+    )
+
+    reasoning_keys = {
+        "reasoning",
+        "reasoning_content",
+        "think",
+        "think_fast",
+        "think_faster",
+    }
+    assert conversation[1][expected_key] == reasoning_fields[expected_key]
+    assert not (reasoning_keys - {expected_key}) & conversation[1].keys()

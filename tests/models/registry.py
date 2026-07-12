@@ -582,6 +582,7 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "MiMoV2ForCausalLM": _HfExamplesInfo(
         "XiaomiMiMo/MiMo-V2.5-Pro", trust_remote_code=True
     ),
+    "XllmForCausalLM": _HfExamplesInfo("LLM360/K2-V3", is_available_online=False),
 }
 
 _EMBEDDING_EXAMPLE_MODELS = {
