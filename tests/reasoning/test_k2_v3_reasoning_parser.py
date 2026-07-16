@@ -14,6 +14,13 @@ EFFORT_TOKENS = {
     "low": ("<ifm|think_faster>", "</ifm|think_faster>"),
 }
 
+TOOL_CALL = (
+    "<ifm|tool_call>get_weather"
+    "<ifm|arg_key>city</ifm|arg_key>"
+    "<ifm|arg_value>Tokyo</ifm|arg_value>"
+    "</ifm|tool_call>"
+)
+
 
 class FakeTokenizer:
     _SPECIAL_TOKENS = sorted(
@@ -208,3 +215,67 @@ def test_unknown_effort_falls_back_to_high(k2_v3_tokenizer):
     parser = _make_parser(k2_v3_tokenizer, "ultra")
     assert parser.start_token == "<ifm|think>"
     assert parser.end_token == "</ifm|think>"
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_streaming_standalone_end_token_emits_empty_reasoning(
+    effort: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    end_token = EFFORT_TOKENS[effort][1]
+    end_token_id = k2_v3_tokenizer.convert_tokens_to_ids(end_token)
+
+    delta = parser.extract_reasoning_streaming(
+        previous_text="",
+        current_text=end_token,
+        delta_text=end_token,
+        previous_token_ids=[],
+        current_token_ids=[end_token_id],
+        delta_token_ids=[end_token_id],
+    )
+
+    assert delta is not None
+    assert delta.reasoning == ""
+    assert delta.content is None
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize(
+    "reasoning",
+    [
+        pytest.param("", id="without_reasoning"),
+        pytest.param("Need lookup", id="with_reasoning"),
+    ],
+)
+def test_streaming_end_token_routes_following_tool_call_to_content(
+    effort: str, reasoning: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    end_token = EFFORT_TOKENS[effort][1]
+    model_deltas = [f"{reasoning}{end_token}", TOOL_CALL]
+    emitted_deltas: list[tuple[str | None, str | None]] = []
+    previous_text = ""
+    previous_token_ids: list[int] = []
+
+    for delta_text in model_deltas:
+        delta_tokens = k2_v3_tokenizer.tokenize(delta_text)
+        delta_token_ids = k2_v3_tokenizer.convert_tokens_to_ids(delta_tokens)
+        current_text = previous_text + delta_text
+        current_token_ids = previous_token_ids + delta_token_ids
+
+        delta = parser.extract_reasoning_streaming(
+            previous_text=previous_text,
+            current_text=current_text,
+            delta_text=delta_text,
+            previous_token_ids=previous_token_ids,
+            current_token_ids=current_token_ids,
+            delta_token_ids=delta_token_ids,
+        )
+        if delta is not None:
+            emitted_deltas.append((delta.reasoning, delta.content))
+
+        previous_text = current_text
+        previous_token_ids = current_token_ids
+
+    expected_deltas = [(reasoning, None), (None, TOOL_CALL)]
+    assert emitted_deltas == expected_deltas

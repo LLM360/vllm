@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Sequence
+
+from vllm.entrypoints.openai.protocol import DeltaMessage
 from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from vllm.tokenizers import TokenizerLike
 
@@ -44,3 +47,24 @@ class K2V3ReasoningParser(DeepSeekR1ReasoningParser):
     @property
     def end_token(self) -> str:
         return self._end_token
+
+    def extract_reasoning_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        previous_token_ids: Sequence[int],
+        current_token_ids: Sequence[int],
+        delta_token_ids: Sequence[int],
+    ) -> DeltaMessage | None:
+        if len(delta_token_ids) == 1 and delta_token_ids[0] == self.end_token_id:
+            return DeltaMessage(reasoning="")
+
+        return super().extract_reasoning_streaming(
+            previous_text,
+            current_text,
+            delta_text,
+            previous_token_ids,
+            current_token_ids,
+            delta_token_ids,
+        )
