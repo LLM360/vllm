@@ -6,11 +6,27 @@ from typing import Any
 
 import pytest
 
-from tests.entrypoints.openai.tool_parsers.utils import run_tool_extraction_nonstreaming
+from tests.entrypoints.openai.tool_parsers.utils import (
+    run_tool_extraction_nonstreaming,
+    run_tool_extraction_streaming,
+)
 from vllm.entrypoints.openai.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.tool_parsers import ToolParser, ToolParserManager
 
 pytestmark = pytest.mark.cpu_test
+
+CALL_1 = (
+    "<ifm|tool_call>get_weather"
+    "<ifm|arg_key>city</ifm|arg_key>"
+    "<ifm|arg_value>Tokyo</ifm|arg_value>"
+    "</ifm|tool_call>"
+)
+CALL_2 = (
+    "<ifm|tool_call>get_time"
+    "<ifm|arg_key>city</ifm|arg_key>"
+    "<ifm|arg_value>Seoul</ifm|arg_value>"
+    "</ifm|tool_call>"
+)
 
 
 class FakeTokenizer:
@@ -30,6 +46,9 @@ class FakeTokenizer:
     def decode(self, token_ids):
         reverse_vocab = {token_id: token for token, token_id in self._vocab.items()}
         return "".join(reverse_vocab[token_id] for token_id in token_ids)
+
+    def tokenize(self, text: str):
+        return [text]
 
 
 def make_parser(tool_call_format: str) -> ToolParser:
@@ -123,9 +142,7 @@ def test_glm_format_matches_template_output():
 
     assert extracted.tools_called
     assert extracted.tool_calls[0].function.name == "get_weather"
-    assert json.loads(extracted.tool_calls[0].function.arguments) == {
-        "city": "Beijing"
-    }
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "Beijing"}
 
 
 def test_ifm_json_format_uses_schema_type_coercion():
@@ -133,7 +150,7 @@ def test_ifm_json_format_uses_schema_type_coercion():
 
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        'Planning.\n<ifm|tool_calls>\n'
+        "Planning.\n<ifm|tool_calls>\n"
         '<ifm|tool_call>{"name":"study_args","arguments":{'
         '"user_id":12345,'
         '"include_revoked":"true",'
@@ -379,9 +396,7 @@ def test_gptoss_format_extracts_multiple_calls():
         "get_time",
     ]
     assert json.loads(extracted.tool_calls[0].function.arguments) == {"location": "SF"}
-    assert json.loads(extracted.tool_calls[1].function.arguments) == {
-        "timezone": "UTC"
-    }
+    assert json.loads(extracted.tool_calls[1].function.arguments) == {"timezone": "UTC"}
 
 
 def test_gptoss_format_with_assistant_prefix():
@@ -389,7 +404,7 @@ def test_gptoss_format_with_assistant_prefix():
 
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        '<tool_call>assistant to=functions.get_weather json\n'
+        "<tool_call>assistant to=functions.get_weather json\n"
         '{"location": "San Francisco, CA", "unit": "celsius"}\n'
         "</tool_call>",
         make_request(),
@@ -435,9 +450,7 @@ def test_python_format_extracts_multiple_calls():
         "get_time",
     ]
     assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "SF"}
-    assert json.loads(extracted.tool_calls[1].function.arguments) == {
-        "timezone": "UTC"
-    }
+    assert json.loads(extracted.tool_calls[1].function.arguments) == {"timezone": "UTC"}
 
 
 def test_python_format_accepts_nested_json_style_literals():
@@ -445,9 +458,9 @@ def test_python_format_accepts_nested_json_style_literals():
 
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        '<tool_call>\n'
+        "<tool_call>\n"
         'get_weather(city="SF", meta={"enabled": true, "missing": null})\n'
-        '</tool_call>',
+        "</tool_call>",
         make_request(),
     )
 
@@ -474,6 +487,69 @@ def test_custom_formats_do_not_stream_yet():
     assert delta is None
 
 
+def test_streaming_emits_leading_content_and_complete_ifm_call_together():
+    parser = make_parser("xml")
+
+    reconstructed = run_tool_extraction_streaming(
+        parser,
+        ["\n" + CALL_1],
+        make_request(),
+    )
+
+    assert reconstructed.other_content == "\n"
+    assert len(reconstructed.tool_calls) == 1
+    assert reconstructed.tool_calls[0].function.name == "get_weather"
+    assert json.loads(reconstructed.tool_calls[0].function.arguments) == {
+        "city": "Tokyo"
+    }
+
+
+def test_streaming_emits_each_complete_ifm_call_once():
+    parser = make_parser("xml")
+
+    reconstructed = run_tool_extraction_streaming(
+        parser,
+        [
+            "<ifm|tool_calls>" + CALL_1,
+            CALL_2 + "</ifm|tool_calls>",
+        ],
+        make_request(),
+    )
+
+    assert [call.function.name for call in reconstructed.tool_calls] == [
+        "get_weather",
+        "get_time",
+    ]
+    assert [
+        json.loads(call.function.arguments) for call in reconstructed.tool_calls
+    ] == [{"city": "Tokyo"}, {"city": "Seoul"}]
+
+
+def test_streaming_records_structured_arguments_for_finish_processing():
+    parser = make_parser("xml")
+
+    run_tool_extraction_streaming(parser, [CALL_1], make_request())
+
+    assert parser.prev_tool_call_arr == [
+        {"name": "get_weather", "arguments": {"city": "Tokyo"}}
+    ]
+    assert parser.streamed_args_for_tool == ['{"city": "Tokyo"}']
+
+
+def test_ifm_streaming_does_not_treat_generic_tool_call_as_marker():
+    parser = make_parser("xml")
+    content = "Use <tool_call> literally in the documentation."
+
+    reconstructed = run_tool_extraction_streaming(
+        parser,
+        [content],
+        make_request(),
+    )
+
+    assert reconstructed.other_content == content
+    assert reconstructed.tool_calls == []
+
+
 def test_readme_json_example():
     parser = make_parser("json")
     extracted = run_tool_extraction_nonstreaming(
@@ -493,13 +569,13 @@ def test_readme_qwen3_example():
     parser = make_parser("qwen3")
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        '<tool_call>\n'
-        '<function=get_weather>\n'
-        '<parameter=location>\n'
-        'San Francisco, CA\n'
-        '</parameter>\n'
-        '</function>\n'
-        '</tool_call>',
+        "<tool_call>\n"
+        "<function=get_weather>\n"
+        "<parameter=location>\n"
+        "San Francisco, CA\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>",
         make_request(),
     )
     assert extracted.tools_called
@@ -513,12 +589,12 @@ def test_readme_minimax_example():
     parser = make_parser("minimax")
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        '<tool_calls>\n'
+        "<tool_calls>\n"
         '<invoke name="get_weather">\n'
         '<parameter name="location">San Francisco, CA</parameter>\n'
         '<parameter name="unit">celsius</parameter>\n'
-        '</invoke>\n'
-        '</tool_calls>',
+        "</invoke>\n"
+        "</tool_calls>",
         make_request(),
     )
     assert extracted.tools_called
@@ -549,12 +625,12 @@ def test_readme_dsv32_example():
     parser = make_parser("dsv32")
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        '<tool_calls>\n'
+        "<tool_calls>\n"
         '<invoke name="get_weather">\n'
         '<parameter name="location" string="true">San Francisco, CA</parameter>\n'
         '<parameter name="unit" string="true">celsius</parameter>\n'
-        '</invoke>\n'
-        '</tool_calls>',
+        "</invoke>\n"
+        "</tool_calls>",
         make_request(),
     )
     assert extracted.tools_called
@@ -569,7 +645,7 @@ def test_readme_gptoss_example():
     parser = make_parser("gptoss")
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        '<tool_call>assistant to=functions.get_weather json\n'
+        "<tool_call>assistant to=functions.get_weather json\n"
         '{"location": "San Francisco, CA", "unit": "celsius"}\n'
         "</tool_call>",
         make_request(),
@@ -586,9 +662,9 @@ def test_readme_python_example():
     parser = make_parser("python")
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        '<tool_call>\n'
+        "<tool_call>\n"
         'get_weather(location="San Francisco, CA", unit="celsius")\n'
-        '</tool_call>',
+        "</tool_call>",
         make_request(),
     )
     assert extracted.tools_called

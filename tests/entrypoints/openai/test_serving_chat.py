@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import json
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
@@ -421,6 +422,109 @@ async def _async_serving_chat_init():
 def test_async_serving_chat_init():
     serving_completion = asyncio.run(_async_serving_chat_init())
     assert serving_completion.chat_template == CHAT_TEMPLATE
+
+
+@pytest.mark.asyncio
+async def test_streaming_final_reasoning_end_and_k2_tool_call():
+    from vllm.entrypoints.openai.protocol import RequestResponseMetadata
+    from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+    from vllm.outputs import CompletionOutput, RequestOutput
+    from vllm.reasoning import ReasoningParserManager
+
+    tool_call = (
+        "<ifm|tool_call>get_weather"
+        "<ifm|arg_key>city</ifm|arg_key>"
+        "<ifm|arg_value>Tokyo</ifm|arg_value>"
+        "</ifm|tool_call>"
+    )
+
+    class FakeK2Tokenizer:
+        def get_vocab(self):
+            return {
+                "<ifm|think>": 1,
+                "</ifm|think>": 2,
+            }
+
+    async def result_generator():
+        yield RequestOutput(
+            request_id="test-request",
+            prompt="prompt",
+            prompt_token_ids=[10],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="</ifm|think>\n" + tool_call,
+                    token_ids=[2, 3],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
+            ],
+            finished=True,
+        )
+
+    serving_chat = object.__new__(OpenAIServingChat)
+    serving_chat.use_harmony = False
+    serving_chat.tool_call_id_type = "random"
+    serving_chat.tool_parser = ToolParserManager.get_tool_parser("multi_format")
+    serving_chat.reasoning_parser = ReasoningParserManager.get_reasoning_parser("k2_v3")
+    serving_chat.enable_auto_tools = True
+    serving_chat.enable_force_include_usage = False
+    serving_chat.enable_prompt_tokens_details = False
+    serving_chat.enable_log_outputs = False
+    serving_chat.request_logger = None
+    serving_chat.response_role = "assistant"
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "What is the weather in Tokyo?"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        tool_choice="auto",
+        stream=True,
+        chat_template_kwargs={"tool_call_format": "xml"},
+    )
+    chunks = []
+    async for event in serving_chat.chat_completion_stream_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="test-request",
+        model_name="test-model",
+        conversation=[{"role": "user", "content": "What is the weather in Tokyo?"}],
+        tokenizer=FakeK2Tokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="test-request"),
+    ):
+        if event.startswith("data: {"):
+            chunks.append(json.loads(event[6:]))
+
+    final_choice = next(
+        chunk["choices"][0]
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["finish_reason"] is not None
+    )
+    delta = final_choice["delta"]
+    assert final_choice["finish_reason"] == "tool_calls"
+    assert delta["reasoning"] == ""
+    assert delta["reasoning_content"] == ""
+    assert delta["content"] == "\n"
+    assert len(delta["tool_calls"]) == 1
+    streamed_tool_call = delta["tool_calls"][0]
+    assert streamed_tool_call["id"]
+    assert streamed_tool_call["function"]["name"] == "get_weather"
+    assert json.loads(streamed_tool_call["function"]["arguments"]) == {"city": "Tokyo"}
 
 
 @pytest.mark.asyncio
