@@ -122,7 +122,7 @@ class MultiFormatToolParser(ToolParser):
         self._delegate: ToolParser | None = None
         self._streaming_tool_call_started = False
         self._streaming_content_buffer = ""
-        self._streaming_tool_calls_emitted = False
+        self._streaming_tool_calls_emitted = 0
 
         if self.tool_format == "qwen3":
             from vllm.entrypoints.openai.tool_parsers.qwen3xml_tool_parser import (
@@ -135,8 +135,7 @@ class MultiFormatToolParser(ToolParser):
     def _validate_tool_format(cls, tool_format: Any) -> str:
         if not isinstance(tool_format, str):
             raise ValueError(
-                "tool_call_format must be a string. "
-                f"Got {type(tool_format).__name__}."
+                f"tool_call_format must be a string. Got {type(tool_format).__name__}."
             )
         if tool_format not in cls._SUPPORTED_TOOL_FORMATS:
             supported_formats = ", ".join(sorted(cls._SUPPORTED_TOOL_FORMATS))
@@ -212,18 +211,24 @@ class MultiFormatToolParser(ToolParser):
 
         return self._extract_tool_calls_streaming_fallback(delta_text, request)
 
-    @classmethod
-    def _tool_call_markers(cls) -> tuple[str, ...]:
-        return (
-            cls._IFM_TOOL_CALLS_START_TOKEN,
-            cls._IFM_TOOL_CALL_START_TOKEN,
-            cls._MINIMAX_START_TOKEN,
-            "<tool_call>",
-        )
+    def _tool_call_markers(self) -> tuple[str, ...]:
+        if self.tool_format in {"json", "xml", "xml_typed"}:
+            return (
+                self._IFM_TOOL_CALLS_START_TOKEN,
+                self._IFM_TOOL_CALL_START_TOKEN,
+            )
+        if self.tool_format in {"minimax", "dsv32"}:
+            return (self._MINIMAX_START_TOKEN,)
+        if self.tool_format == "glm":
+            return (
+                self._IFM_TOOL_CALLS_START_TOKEN,
+                self._IFM_TOOL_CALL_START_TOKEN,
+                "<tool_call>",
+            )
+        return ("<tool_call>",)
 
-    @classmethod
-    def _partial_tool_call_marker_start(cls, text: str) -> int | None:
-        markers = cls._tool_call_markers()
+    def _partial_tool_call_marker_start(self, text: str) -> int | None:
+        markers = self._tool_call_markers()
         max_marker_len = max(len(marker) for marker in markers)
         start = max(0, len(text) - max_marker_len + 1)
         for index in range(start, len(text)):
@@ -245,29 +250,34 @@ class MultiFormatToolParser(ToolParser):
         )
 
     def _try_emit_streaming_tool_calls(
-        self, request: ChatCompletionRequest
+        self,
+        request: ChatCompletionRequest,
+        content: str | None = None,
     ) -> DeltaMessage | None:
-        if self._streaming_tool_calls_emitted:
-            return None
-
         parsed = self.extract_tool_calls(self._streaming_content_buffer, request)
         if not parsed.tools_called or not parsed.tool_calls:
-            return None
+            return DeltaMessage(content=content) if content is not None else None
 
-        self._streaming_tool_calls_emitted = True
-        self.prev_tool_call_arr = []
-        self.streamed_args_for_tool = []
+        new_tool_calls = parsed.tool_calls[self._streaming_tool_calls_emitted :]
+        if not new_tool_calls:
+            return DeltaMessage(content=content) if content is not None else None
+
         tool_call_deltas: list[DeltaToolCall] = []
-        for index, tool_call in enumerate(parsed.tool_calls):
+        for tool_call in new_tool_calls:
+            index = self._streaming_tool_calls_emitted
             arguments = tool_call.function.arguments
+            try:
+                parsed_arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                parsed_arguments = arguments
             self.prev_tool_call_arr.append(
-                {"name": tool_call.function.name, "arguments": arguments}
+                {"name": tool_call.function.name, "arguments": parsed_arguments}
             )
             self.streamed_args_for_tool.append(arguments)
             tool_call_deltas.append(self._delta_tool_call(index, tool_call))
+            self._streaming_tool_calls_emitted += 1
 
-        self._streaming_content_buffer = ""
-        return DeltaMessage(tool_calls=tool_call_deltas)
+        return DeltaMessage(content=content, tool_calls=tool_call_deltas)
 
     def _extract_tool_calls_streaming_fallback(
         self, delta_text: str, request: ChatCompletionRequest
@@ -287,9 +297,10 @@ class MultiFormatToolParser(ToolParser):
             self._streaming_tool_call_started = True
             content = buffer[:first_marker_pos]
             self._streaming_content_buffer = buffer[first_marker_pos:]
-            if content:
-                return DeltaMessage(content=content)
-            return self._try_emit_streaming_tool_calls(request)
+            return self._try_emit_streaming_tool_calls(
+                request,
+                content=content or None,
+            )
 
         partial_start = self._partial_tool_call_marker_start(buffer)
         if partial_start is not None:
@@ -464,9 +475,7 @@ class MultiFormatToolParser(ToolParser):
                 function_name = function.get("name")
                 if not function_name:
                     raise ValueError("Tool call JSON is missing a function name.")
-                arguments = self._json_arguments_to_dict(
-                    function.get("arguments", {})
-                )
+                arguments = self._json_arguments_to_dict(function.get("arguments", {}))
                 arguments = self._coerce_arguments(
                     function_name,
                     arguments,
