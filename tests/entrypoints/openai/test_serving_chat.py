@@ -425,17 +425,35 @@ def test_async_serving_chat_init():
 
 
 @pytest.mark.asyncio
-async def test_streaming_final_reasoning_end_and_k2_tool_call():
+@pytest.mark.parametrize(
+    "model_deltas",
+    [
+        pytest.param(
+            [("</ifm|think>\n{tool_call}", [2, 3], "stop")],
+            id="same_delta",
+        ),
+        pytest.param(
+            [
+                ("</ifm|think>", [2], None),
+                ("\n{tool_call}", [3], "stop"),
+            ],
+            id="split_deltas",
+        ),
+    ],
+)
+async def test_streaming_reasoning_end_and_k2_tool_call(model_deltas):
     from vllm.entrypoints.openai.protocol import RequestResponseMetadata
     from vllm.entrypoints.openai.tool_parsers import ToolParserManager
     from vllm.outputs import CompletionOutput, RequestOutput
     from vllm.reasoning import ReasoningParserManager
 
     tool_call = (
+        "<ifm|tool_calls>"
         "<ifm|tool_call>get_weather"
         "<ifm|arg_key>city</ifm|arg_key>"
         "<ifm|arg_value>Tokyo</ifm|arg_value>"
         "</ifm|tool_call>"
+        "</ifm|tool_calls>"
     )
 
     class FakeK2Tokenizer:
@@ -446,29 +464,30 @@ async def test_streaming_final_reasoning_end_and_k2_tool_call():
             }
 
     async def result_generator():
-        yield RequestOutput(
-            request_id="test-request",
-            prompt="prompt",
-            prompt_token_ids=[10],
-            prompt_logprobs=None,
-            outputs=[
-                CompletionOutput(
-                    index=0,
-                    text="</ifm|think>\n" + tool_call,
-                    token_ids=[2, 3],
-                    cumulative_logprob=0.0,
-                    logprobs=None,
-                    finish_reason="stop",
-                    stop_reason=None,
-                )
-            ],
-            finished=True,
-        )
+        for text, token_ids, finish_reason in model_deltas:
+            yield RequestOutput(
+                request_id="test-request",
+                prompt="prompt",
+                prompt_token_ids=[10],
+                prompt_logprobs=None,
+                outputs=[
+                    CompletionOutput(
+                        index=0,
+                        text=text.format(tool_call=tool_call),
+                        token_ids=token_ids,
+                        cumulative_logprob=0.0,
+                        logprobs=None,
+                        finish_reason=finish_reason,
+                        stop_reason=None,
+                    )
+                ],
+                finished=finish_reason is not None,
+            )
 
     serving_chat = object.__new__(OpenAIServingChat)
     serving_chat.use_harmony = False
     serving_chat.tool_call_id_type = "random"
-    serving_chat.tool_parser = ToolParserManager.get_tool_parser("multi_format")
+    serving_chat.tool_parser = ToolParserManager.get_tool_parser("k2_v3")
     serving_chat.reasoning_parser = ReasoningParserManager.get_reasoning_parser("k2_v3")
     serving_chat.enable_auto_tools = True
     serving_chat.enable_force_include_usage = False
@@ -516,10 +535,28 @@ async def test_streaming_final_reasoning_end_and_k2_tool_call():
         if chunk["choices"] and chunk["choices"][0]["finish_reason"] is not None
     )
     delta = final_choice["delta"]
+    reasoning_deltas = [
+        chunk["choices"][0]["delta"]["reasoning"]
+        for chunk in chunks
+        if chunk["choices"]
+        and chunk["choices"][0]["delta"].get("reasoning") is not None
+    ]
+    reasoning_content_deltas = [
+        chunk["choices"][0]["delta"]["reasoning_content"]
+        for chunk in chunks
+        if chunk["choices"]
+        and chunk["choices"][0]["delta"].get("reasoning_content") is not None
+    ]
+    content = "".join(
+        chunk["choices"][0]["delta"].get("content") or ""
+        for chunk in chunks
+        if chunk["choices"]
+    )
+
+    assert reasoning_deltas == [""]
+    assert reasoning_content_deltas == [""]
+    assert content == "\n"
     assert final_choice["finish_reason"] == "tool_calls"
-    assert delta["reasoning"] == ""
-    assert delta["reasoning_content"] == ""
-    assert delta["content"] == "\n"
     assert len(delta["tool_calls"]) == 1
     streamed_tool_call = delta["tool_calls"][0]
     assert streamed_tool_call["id"]

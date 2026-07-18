@@ -836,6 +836,13 @@ class K2V3ToolParser(MultiFormatToolParser):
 
     preserve_empty_content = True
 
+    def _tool_call_markers(self) -> tuple[str, ...]:
+        if self.tool_format in {"json", "xml", "xml_typed"}:
+            return (self._IFM_TOOL_CALLS_START_TOKEN,)
+        if self.tool_format == "glm":
+            return (self._IFM_TOOL_CALLS_START_TOKEN, "<tool_call>")
+        return super()._tool_call_markers()
+
     def extract_tool_calls(
         self,
         model_output: str,

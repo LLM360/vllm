@@ -27,6 +27,7 @@ CALL_2 = (
     "<ifm|arg_value>Seoul</ifm|arg_value>"
     "</ifm|tool_call>"
 )
+GROUPED_CALL_1 = f"<ifm|tool_calls>{CALL_1}</ifm|tool_calls>"
 
 
 class FakeTokenizer:
@@ -53,6 +54,13 @@ class FakeTokenizer:
 
 def make_parser(tool_call_format: str) -> ToolParser:
     return ToolParserManager.get_tool_parser("multi_format")(
+        FakeTokenizer(),
+        chat_template_kwargs={"tool_call_format": tool_call_format},
+    )
+
+
+def make_k2_parser(tool_call_format: str = "xml") -> ToolParser:
+    return ToolParserManager.get_tool_parser("k2_v3")(
         FakeTokenizer(),
         chat_template_kwargs={"tool_call_format": tool_call_format},
     )
@@ -628,6 +636,32 @@ def test_ifm_streaming_does_not_treat_generic_tool_call_as_marker():
 
     assert reconstructed.other_content == content
     assert reconstructed.tool_calls == []
+
+
+def test_k2_v3_streaming_requires_grouped_ifm_tool_calls():
+    parser = make_k2_parser()
+
+    reconstructed = run_tool_extraction_streaming(
+        parser,
+        [CALL_1],
+        make_request(),
+    )
+
+    assert reconstructed.other_content == CALL_1
+    assert reconstructed.tool_calls == []
+
+
+def test_k2_v3_streaming_parses_grouped_ifm_tool_calls():
+    parser = make_k2_parser()
+
+    reconstructed = run_tool_extraction_streaming(
+        parser,
+        [GROUPED_CALL_1],
+        make_request(),
+    )
+
+    assert reconstructed.other_content == ""
+    assert [call.function.name for call in reconstructed.tool_calls] == ["get_weather"]
 
 
 def test_readme_json_example():
