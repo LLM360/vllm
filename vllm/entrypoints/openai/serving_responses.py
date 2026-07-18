@@ -1223,6 +1223,14 @@ class OpenAIServingResponses(OpenAIServing):
                 previous_token_ids += output.token_ids
                 if not delta_message:
                     continue
+                if delta_message.reasoning == "":
+                    # Some parsers use empty reasoning to mark a reasoning
+                    # boundary. The parser state above must still be advanced,
+                    # but the empty value is not user-visible reasoning.
+                    delta_message.reasoning = None
+                    delta_message.reasoning_content = None
+                    if delta_message.content is None and not delta_message.tool_calls:
+                        continue
                 if not first_delta_sent:
                     current_item_id = str(uuid.uuid4())
                     if delta_message.reasoning:

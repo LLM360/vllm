@@ -13,8 +13,12 @@ from openai.types.responses.tool import (
     Tool,
 )
 
-from vllm.entrypoints.context import ConversationContext
-from vllm.entrypoints.openai.protocol import ErrorResponse, ResponsesRequest
+from vllm.entrypoints.context import ConversationContext, SimpleContext
+from vllm.entrypoints.openai.protocol import (
+    DeltaMessage,
+    ErrorResponse,
+    ResponsesRequest,
+)
 from vllm.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _extract_allowed_tools_from_mcp_requests,
@@ -112,6 +116,117 @@ def test_extract_tool_types(monkeypatch: pytest.MonkeyPatch) -> None:
         "code_interpreter",
         "web_search_preview",
     }
+
+
+async def _collect_simple_streaming_events(
+    deltas: list[DeltaMessage],
+):
+    parser = MagicMock()
+    parser_calls = []
+    pending_deltas = iter(deltas)
+
+    def extract_reasoning_streaming(**kwargs):
+        parser_calls.append(
+            {
+                "previous_text": kwargs["previous_text"],
+                "previous_token_ids": list(kwargs["previous_token_ids"]),
+            }
+        )
+        return next(pending_deltas)
+
+    parser.extract_reasoning_streaming.side_effect = extract_reasoning_streaming
+
+    serving_responses = MagicMock(spec=OpenAIServingResponses)
+    serving_responses.reasoning_parser = lambda _tokenizer: parser
+
+    async def result_generator():
+        for token_id in range(1, len(deltas) + 1):
+            context = SimpleContext()
+            output = MagicMock()
+            output.text = f"delta-{token_id}"
+            output.token_ids = [token_id]
+            output.logprobs = None
+            context.last_output = MagicMock(outputs=[output])
+            yield context
+
+    events = [
+        event
+        async for event in OpenAIServingResponses._process_simple_streaming_events(
+            serving_responses,
+            request=ResponsesRequest(input="test", stream=True, store=False),
+            sampling_params=MagicMock(),
+            result_generator=result_generator(),
+            context=SimpleContext(),
+            model_name="model",
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+            created_time=0,
+            _increment_sequence_number_and_return=lambda event: event,
+        )
+    ]
+    return events, parser_calls
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_skips_empty_reasoning_boundary():
+    events, parser_calls = await _collect_simple_streaming_events(
+        [
+            DeltaMessage(reasoning=""),
+            DeltaMessage(content="The answer is 42."),
+        ]
+    )
+
+    assert [event.type for event in events] == [
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+    ]
+    assert events[0].item.type == "message"
+    assert events[2].delta == "The answer is 42."
+
+    assert parser_calls[1]["previous_text"] == "delta-1"
+    assert parser_calls[1]["previous_token_ids"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_treats_combined_empty_reasoning_as_content():
+    events, _ = await _collect_simple_streaming_events(
+        [DeltaMessage(reasoning="", content="The answer is 42.")]
+    )
+
+    assert not any("reasoning" in event.type for event in events)
+    text_delta = next(
+        event for event in events if event.type == "response.output_text.delta"
+    )
+    assert text_delta.delta == "The answer is 42."
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_preserves_nonempty_reasoning_before_boundary():
+    events, _ = await _collect_simple_streaming_events(
+        [
+            DeltaMessage(reasoning="Need to calculate."),
+            DeltaMessage(reasoning=""),
+            DeltaMessage(content="The answer is 42."),
+        ]
+    )
+
+    reasoning_deltas = [
+        event.delta for event in events if event.type == "response.reasoning_text.delta"
+    ]
+    reasoning_done = next(
+        event for event in events if event.type == "response.reasoning_text.done"
+    )
+    text_deltas = [
+        event.delta for event in events if event.type == "response.output_text.delta"
+    ]
+
+    assert reasoning_deltas == ["Need to calculate."]
+    assert reasoning_done.text == "Need to calculate."
+    assert text_deltas == ["The answer is 42."]
 
 
 class TestInitializeToolSessions:
