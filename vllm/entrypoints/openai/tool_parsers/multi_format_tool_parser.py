@@ -730,3 +730,15 @@ class MultiFormatToolParser(ToolParser):
 
 class K2V3ToolParser(MultiFormatToolParser):
     """K2-V3 parser for BBQ 0518 IFM tool-call and reasoning tokens."""
+
+    preserve_empty_content = True
+
+    def extract_tool_calls(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest,
+    ) -> ExtractedToolCallInformation:
+        extracted = super().extract_tool_calls(model_output, request)
+        if extracted.tools_called and extracted.content is None:
+            extracted.content = ""
+        return extracted

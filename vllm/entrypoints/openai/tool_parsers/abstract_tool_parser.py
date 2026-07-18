@@ -36,6 +36,10 @@ class ToolParser:
     derived classes.
     """
 
+    # Keep an empty non-streaming content string instead of normalizing it to
+    # None after successful tool-call extraction.
+    preserve_empty_content = False
+
     def __init__(self, tokenizer: TokenizerLike):
         self.prev_tool_call_arr: list[dict] = []
         # the index of the tool call that is currently being parsed

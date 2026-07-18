@@ -310,6 +310,7 @@ def test_k2_v3_parser_alias_uses_ifm_formats():
     )
 
     assert extracted.tools_called
+    assert extracted.content == ""
     assert json.loads(extracted.tool_calls[0].function.arguments) == {
         "user_id": "12345"
     }
@@ -334,7 +335,7 @@ def test_k2_v3_parser_strips_0518_ifm_reasoning_prefix():
     )
 
     assert extracted.tools_called
-    assert extracted.content is None
+    assert extracted.content == ""
     assert extracted.tool_calls[0].function.name == "get_weather"
     assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "Tokyo"}
 

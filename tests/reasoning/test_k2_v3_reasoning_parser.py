@@ -4,6 +4,13 @@
 import pytest
 
 from tests.reasoning.utils import run_reasoning_extraction
+from vllm.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ChatMessage,
+    ToolCall,
+)
+from vllm.entrypoints.openai.serving_engine import OpenAIServing
+from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 
 PARSER_NAME = "k2_v3"
@@ -14,21 +21,68 @@ EFFORT_TOKENS = {
     "low": ("<ifm|think_faster>", "</ifm|think_faster>"),
 }
 
-TOOL_CALL = (
-    "<ifm|tool_call>get_weather"
-    "<ifm|arg_key>city</ifm|arg_key>"
-    "<ifm|arg_value>Tokyo</ifm|arg_value>"
-    "</ifm|tool_call>"
-)
+
+def _tool_call(name: str) -> str:
+    return (
+        f"<ifm|tool_call>{name}"
+        "<ifm|arg_key>city</ifm|arg_key>"
+        "<ifm|arg_value>Tokyo</ifm|arg_value>"
+        "</ifm|tool_call>"
+    )
+
+
+TOOL_CALL = _tool_call("get_weather")
+GROUPED_TOOL_CALL = f"<ifm|tool_calls>{TOOL_CALL}</ifm|tool_calls>"
+SECOND_TOOL_CALL = _tool_call("get_time")
+GROUPED_TOOL_CALLS = f"<ifm|tool_calls>{TOOL_CALL}{SECOND_TOOL_CALL}</ifm|tool_calls>"
+
+
+def _make_nonstreaming_message(
+    model_output: str,
+    tokenizer,
+    effort: str = "high",
+) -> ChatMessage:
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[],
+        tool_choice="auto",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+            for name in ("get_weather", "get_time")
+        ],
+    )
+    reasoning_parser = _make_parser(tokenizer, effort)
+    reasoning, content = reasoning_parser.extract_reasoning(model_output, request)
+    function_calls, parsed_content = OpenAIServing._parse_tool_calls_from_content(
+        request=request,
+        tokenizer=tokenizer,
+        content=content,
+        enable_auto_tools=True,
+        tool_parser_cls=ToolParserManager.get_tool_parser(PARSER_NAME),
+        chat_template_kwargs={"tool_call_format": "xml"},
+    )
+    tool_calls = [ToolCall(function=call) for call in function_calls or []]
+
+    return ChatMessage(
+        role="assistant",
+        reasoning=reasoning,
+        content=parsed_content,
+        tool_calls=tool_calls,
+    )
 
 
 class FakeTokenizer:
     _SPECIAL_TOKENS = sorted(
-        {
-            token
-            for token_pair in EFFORT_TOKENS.values()
-            for token in token_pair
-        },
+        {token for token_pair in EFFORT_TOKENS.values() for token in token_pair},
         key=len,
         reverse=True,
     )
@@ -101,12 +155,15 @@ def _cases_for_effort(start: str, end: str):
             "output": f"This is reasoning{end}",
             "reasoning": "This is reasoning",
             "content": None,
+            "nonstreaming_content": "",
             "is_reasoning_end": True,
         },
         "no_end_token": {
             "output": "This is reasoning only",
             "reasoning": "This is reasoning only",
             "content": None,
+            "nonstreaming_reasoning": "",
+            "nonstreaming_content": "This is reasoning only",
             "is_reasoning_end": False,
         },
         "with_start_token": {
@@ -119,6 +176,8 @@ def _cases_for_effort(start: str, end: str):
             "output": f"{start}Still thinking",
             "reasoning": "Still thinking",
             "content": None,
+            "nonstreaming_reasoning": "",
+            "nonstreaming_content": "Still thinking",
             "is_reasoning_end": False,
         },
         "multiple_lines": {
@@ -173,8 +232,16 @@ def test_reasoning(
         parser, output_tokens, streaming=streaming
     )
 
-    assert reasoning == param_dict["reasoning"]
-    assert content == param_dict["content"]
+    expected_reasoning = param_dict.get(
+        "nonstreaming_reasoning" if not streaming else "streaming_reasoning",
+        param_dict["reasoning"],
+    )
+    expected_content = param_dict.get(
+        "nonstreaming_content" if not streaming else "streaming_content",
+        param_dict["content"],
+    )
+    assert reasoning == expected_reasoning
+    assert content == expected_content
 
     # Test is_reasoning_end
     output_ids = k2_v3_tokenizer.convert_tokens_to_ids(output)
@@ -215,6 +282,234 @@ def test_unknown_effort_falls_back_to_high(k2_v3_tokenizer):
     parser = _make_parser(k2_v3_tokenizer, "ultra")
     assert parser.start_token == "<ifm|think>"
     assert parser.end_token == "</ifm|think>"
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param("", id="empty_output"),
+        pytest.param("The answer is 42.", id="content"),
+    ],
+)
+def test_nonstreaming_without_boundary_returns_content(
+    effort: str,
+    output: str,
+    k2_v3_tokenizer,
+):
+    message = _make_nonstreaming_message(
+        output,
+        k2_v3_tokenizer,
+        effort,
+    )
+
+    assert message.reasoning == ""
+    assert message.reasoning_content == ""
+    assert isinstance(message.reasoning, str)
+    assert isinstance(message.reasoning_content, str)
+    assert message.content == output
+    assert message.tool_calls == []
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize(
+    "tool_section, expected_tool_names",
+    [
+        pytest.param(GROUPED_TOOL_CALL, ["get_weather"], id="grouped"),
+        pytest.param(
+            GROUPED_TOOL_CALLS,
+            ["get_weather", "get_time"],
+            id="multiple_grouped",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "reasoning",
+    [
+        pytest.param("", id="empty_reasoning"),
+        pytest.param("Need lookup. ", id="with_reasoning"),
+    ],
+)
+def test_nonstreaming_tool_calls_wrapper_implicitly_ends_unclosed_reasoning(
+    effort: str,
+    tool_section: str,
+    expected_tool_names: list[str],
+    reasoning: str,
+    k2_v3_tokenizer,
+):
+    message = _make_nonstreaming_message(
+        f"{reasoning}{tool_section}",
+        k2_v3_tokenizer,
+        effort,
+    )
+
+    assert message.reasoning == reasoning
+    assert message.reasoning_content == reasoning
+    assert isinstance(message.reasoning, str)
+    assert isinstance(message.reasoning_content, str)
+    assert message.content == ""
+    assert [tool.function.name for tool in message.tool_calls] == expected_tool_names
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_nonstreaming_generated_start_with_unclosed_tool_call(
+    effort: str, k2_v3_tokenizer
+):
+    start_token = EFFORT_TOKENS[effort][0]
+    message = _make_nonstreaming_message(
+        f"{start_token}Need lookup. {GROUPED_TOOL_CALL}",
+        k2_v3_tokenizer,
+        effort,
+    )
+
+    assert message.reasoning == "Need lookup. "
+    assert message.reasoning_content == "Need lookup. "
+    assert message.content == ""
+    assert [tool.function.name for tool in message.tool_calls] == ["get_weather"]
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize(
+    "incomplete_tool",
+    [
+        pytest.param("<ifm|tool_calls>", id="wrapper_only"),
+        pytest.param(
+            "<ifm|tool_calls><ifm|tool_call>get_weather",
+            id="incomplete_inner_call",
+        ),
+    ],
+)
+def test_nonstreaming_incomplete_tool_calls_wrapper_is_implicit_boundary(
+    effort: str,
+    incomplete_tool: str,
+    k2_v3_tokenizer,
+):
+    output = f"Need lookup. {incomplete_tool}"
+    message = _make_nonstreaming_message(output, k2_v3_tokenizer, effort)
+
+    assert message.reasoning == "Need lookup. "
+    assert message.reasoning_content == "Need lookup. "
+    assert message.content == incomplete_tool
+    assert message.tool_calls == []
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_nonstreaming_singular_tool_tag_is_not_an_implicit_boundary(
+    effort: str,
+    k2_v3_tokenizer,
+):
+    output = f"Need lookup. {TOOL_CALL}"
+    request = ChatCompletionRequest(model="test-model", messages=[])
+    parser = _make_parser(k2_v3_tokenizer, effort)
+
+    reasoning, content = parser.extract_reasoning(output, request)
+
+    assert reasoning == ""
+    assert content == output
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize(
+    "reasoning, tail, expected_content, expected_tool_names",
+    [
+        pytest.param("", "", "", [], id="close_only"),
+        pytest.param("Need lookup.", "", "", [], id="reasoning_only"),
+        pytest.param(
+            "", "The answer is 42.", "The answer is 42.", [], id="content_only"
+        ),
+        pytest.param(
+            "Need lookup.",
+            GROUPED_TOOL_CALL,
+            "",
+            ["get_weather"],
+            id="single_tool_only",
+        ),
+        pytest.param(
+            "Need two lookups.",
+            GROUPED_TOOL_CALLS,
+            "",
+            ["get_weather", "get_time"],
+            id="multiple_tools_only",
+        ),
+        pytest.param(
+            "Need lookup.",
+            f"Calling the tool.\n{GROUPED_TOOL_CALL}",
+            "Calling the tool.\n",
+            ["get_weather"],
+            id="content_and_tool",
+        ),
+    ],
+)
+def test_nonstreaming_explicit_close_response_matrix(
+    effort: str,
+    reasoning: str,
+    tail: str,
+    expected_content: str,
+    expected_tool_names: list[str],
+    k2_v3_tokenizer,
+):
+    end_token = EFFORT_TOKENS[effort][1]
+    message = _make_nonstreaming_message(
+        f"{reasoning}{end_token}{tail}",
+        k2_v3_tokenizer,
+        effort,
+    )
+
+    assert message.reasoning == reasoning
+    assert message.reasoning_content == reasoning
+    assert isinstance(message.reasoning, str)
+    assert isinstance(message.reasoning_content, str)
+    assert message.content == expected_content
+    assert [tool.function.name for tool in message.tool_calls] == expected_tool_names
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_nonstreaming_explicit_close_takes_precedence_over_tool_marker(
+    effort: str, k2_v3_tokenizer
+):
+    end_token = EFFORT_TOKENS[effort][1]
+    reasoning_tool = _tool_call("consider_weather")
+    output_tool = GROUPED_TOOL_CALL
+    expected_reasoning = f"Maybe call this tool: {reasoning_tool}"
+
+    message = _make_nonstreaming_message(
+        f"{expected_reasoning}{end_token}{output_tool}",
+        k2_v3_tokenizer,
+        effort,
+    )
+
+    assert message.reasoning == expected_reasoning
+    assert message.reasoning_content == expected_reasoning
+    assert message.content == ""
+    assert [tool.function.name for tool in message.tool_calls] == ["get_weather"]
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize(
+    "tail, expected_content, expected_tool_names",
+    [
+        pytest.param("The answer is 42.", "The answer is 42.", [], id="content"),
+        pytest.param(GROUPED_TOOL_CALL, "", ["get_weather"], id="tool"),
+    ],
+)
+def test_nonstreaming_multiple_close_tokens_preserve_extra_close_as_content(
+    effort: str,
+    tail: str,
+    expected_content: str,
+    expected_tool_names: list[str],
+    k2_v3_tokenizer,
+):
+    end_token = EFFORT_TOKENS[effort][1]
+    message = _make_nonstreaming_message(
+        f"Need lookup.{end_token}{end_token}{tail}",
+        k2_v3_tokenizer,
+        effort,
+    )
+
+    assert message.reasoning == "Need lookup."
+    assert message.reasoning_content == "Need lookup."
+    assert message.content == f"{end_token}{expected_content}"
+    assert [tool.function.name for tool in message.tool_calls] == expected_tool_names
 
 
 @pytest.mark.parametrize("effort", _EFFORTS)
