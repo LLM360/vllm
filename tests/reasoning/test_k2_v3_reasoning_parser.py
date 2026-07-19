@@ -82,7 +82,8 @@ def _make_nonstreaming_message(
 
 class FakeTokenizer:
     _SPECIAL_TOKENS = sorted(
-        {token for token_pair in EFFORT_TOKENS.values() for token in token_pair},
+        {token for token_pair in EFFORT_TOKENS.values() for token in token_pair}
+        | {"<ifm|tool_calls>"},
         key=len,
         reverse=True,
     )
@@ -137,6 +138,30 @@ def _make_parser(tokenizer, effort="high") -> ReasoningParser:
     )
 
 
+def _run_streaming_deltas(parser, tokenizer, deltas: list[str]):
+    emitted = []
+    previous_text = ""
+    previous_token_ids: list[int] = []
+    for delta_text in deltas:
+        delta_tokens = tokenizer.tokenize(delta_text)
+        delta_token_ids = tokenizer.convert_tokens_to_ids(delta_tokens)
+        current_text = previous_text + delta_text
+        current_token_ids = previous_token_ids + delta_token_ids
+        delta = parser.extract_reasoning_streaming(
+            previous_text=previous_text,
+            current_text=current_text,
+            delta_text=delta_text,
+            previous_token_ids=previous_token_ids,
+            current_token_ids=current_token_ids,
+            delta_token_ids=delta_token_ids,
+        )
+        if delta is not None:
+            emitted.append(delta)
+        previous_text = current_text
+        previous_token_ids = current_token_ids
+    return emitted
+
+
 # ---------------------------------------------------------------------------
 # Test cases parameterised by effort level
 # ---------------------------------------------------------------------------
@@ -164,6 +189,8 @@ def _cases_for_effort(start: str, end: str):
             "content": None,
             "nonstreaming_reasoning": "",
             "nonstreaming_content": "This is reasoning only",
+            "streaming_reasoning": "",
+            "streaming_content": "This is reasoning only",
             "is_reasoning_end": False,
         },
         "with_start_token": {
@@ -178,6 +205,8 @@ def _cases_for_effort(start: str, end: str):
             "content": None,
             "nonstreaming_reasoning": "",
             "nonstreaming_content": "Still thinking",
+            "streaming_reasoning": "",
+            "streaming_content": "Still thinking",
             "is_reasoning_end": False,
         },
         "multiple_lines": {
@@ -228,9 +257,23 @@ def test_reasoning(
     ]
     parser = _make_parser(k2_v3_tokenizer, effort)
 
-    reasoning, content = run_reasoning_extraction(
-        parser, output_tokens, streaming=streaming
-    )
+    if streaming:
+        emitted = _run_streaming_deltas(parser, k2_v3_tokenizer, output_tokens)
+        finalization = parser.finalize_reasoning_streaming()
+        if finalization is not None and finalization.delta is not None:
+            emitted.append(finalization.delta)
+        reasoning_parts = [
+            delta.reasoning for delta in emitted if delta.reasoning is not None
+        ]
+        content_parts = [
+            delta.content for delta in emitted if delta.content is not None
+        ]
+        reasoning = "".join(reasoning_parts) if reasoning_parts else None
+        content = "".join(content_parts) if content_parts else None
+    else:
+        reasoning, content = run_reasoning_extraction(
+            parser, output_tokens, streaming=False
+        )
 
     expected_reasoning = param_dict.get(
         "nonstreaming_reasoning" if not streaming else "streaming_reasoning",
@@ -377,6 +420,10 @@ def test_nonstreaming_generated_start_with_unclosed_tool_call(
             "<ifm|tool_calls><ifm|tool_call>get_weather",
             id="incomplete_inner_call",
         ),
+        pytest.param(
+            f"<ifm|tool_calls>{TOOL_CALL}",
+            id="complete_inner_missing_wrapper_close",
+        ),
     ],
 )
 def test_nonstreaming_incomplete_tool_calls_wrapper_is_implicit_boundary(
@@ -406,6 +453,51 @@ def test_nonstreaming_singular_tool_tag_is_not_an_implicit_boundary(
 
     assert reasoning == ""
     assert content == output
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_nonstreaming_singular_tool_tag_remains_content_in_serving(
+    effort: str,
+    k2_v3_tokenizer,
+):
+    output = f"Need lookup. {TOOL_CALL}"
+
+    message = _make_nonstreaming_message(output, k2_v3_tokenizer, effort)
+
+    assert message.reasoning == ""
+    assert message.reasoning_content == ""
+    assert message.content == output
+    assert message.tool_calls == []
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize(
+    "tool_markup",
+    [
+        pytest.param(TOOL_CALL, id="singular"),
+        pytest.param(
+            f"<ifm|tool_calls>{TOOL_CALL}",
+            id="incomplete_plural_wrapper",
+        ),
+    ],
+)
+def test_nonstreaming_explicit_close_requires_complete_plural_tool_wrapper(
+    effort: str,
+    tool_markup: str,
+    k2_v3_tokenizer,
+):
+    end_token = EFFORT_TOKENS[effort][1]
+
+    message = _make_nonstreaming_message(
+        f"Need lookup.{end_token}{tool_markup}",
+        k2_v3_tokenizer,
+        effort,
+    )
+
+    assert message.reasoning == "Need lookup."
+    assert message.reasoning_content == "Need lookup."
+    assert message.content == tool_markup
+    assert message.tool_calls == []
 
 
 @pytest.mark.parametrize("effort", _EFFORTS)
@@ -574,3 +666,240 @@ def test_streaming_end_token_routes_following_tool_call_to_content(
 
     expected_deltas = [(reasoning, None), (None, TOOL_CALL)]
     assert emitted_deltas == expected_deltas
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize(
+    "tool_section",
+    [
+        pytest.param(GROUPED_TOOL_CALL, id="single"),
+        pytest.param(GROUPED_TOOL_CALLS, id="multiple"),
+    ],
+)
+def test_streaming_missing_close_quarantines_plural_wrapper_until_finalization(
+    effort: str, tool_section: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    marker = "<ifm|tool_calls>"
+    emitted = _run_streaming_deltas(
+        parser,
+        k2_v3_tokenizer,
+        ["Need lookup. ", marker[:8], marker[8:] + tool_section[len(marker) :]],
+    )
+
+    assert emitted == []
+    finalization = parser.finalize_reasoning_streaming()
+    assert finalization is not None
+    assert finalization.reasoning_ended
+    assert finalization.delta is not None
+    assert finalization.delta.reasoning == "Need lookup. "
+    assert finalization.delta.content == tool_section
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_streaming_failed_plural_marker_candidate_is_released_as_reasoning(
+    effort: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    emitted = _run_streaming_deltas(
+        parser,
+        k2_v3_tokenizer,
+        ["Need ", "<ifm|tool_call", ">not grouped"],
+    )
+
+    assert emitted == []
+    finalization = parser.finalize_reasoning_streaming()
+    assert finalization is not None and finalization.reasoning_ended
+    assert finalization.delta is not None
+    assert finalization.delta.reasoning == ""
+    assert finalization.delta.content == "Need <ifm|tool_call>not grouped"
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_streaming_explicit_close_releases_quarantined_wrapper_as_reasoning(
+    effort: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    end_token = EFFORT_TOKENS[effort][1]
+    emitted = _run_streaming_deltas(
+        parser,
+        k2_v3_tokenizer,
+        ["Maybe ", GROUPED_TOOL_CALL, f" reconsider{end_token}Answer"],
+    )
+
+    assert [(delta.reasoning, delta.content) for delta in emitted] == [
+        (f"Maybe {GROUPED_TOOL_CALL} reconsider", "Answer"),
+    ]
+    assert parser.finalize_reasoning_streaming() is None
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_streaming_only_post_close_plural_wrapper_becomes_content(
+    effort: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    end_token = EFFORT_TOKENS[effort][1]
+    emitted = _run_streaming_deltas(
+        parser,
+        k2_v3_tokenizer,
+        [GROUPED_TOOL_CALL, end_token, GROUPED_TOOL_CALLS],
+    )
+
+    assert [(delta.reasoning, delta.content) for delta in emitted] == [
+        (GROUPED_TOOL_CALL, None),
+        (None, GROUPED_TOOL_CALLS),
+    ]
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize(
+    "incomplete_tool",
+    [
+        pytest.param("<ifm|tool_calls>", id="wrapper"),
+        pytest.param("<ifm|tool_calls><ifm|tool_call>get_weather", id="inner_call"),
+    ],
+)
+def test_streaming_incomplete_plural_wrapper_is_released_at_finalization(
+    effort: str, incomplete_tool: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    emitted = _run_streaming_deltas(
+        parser, k2_v3_tokenizer, [f"Need lookup. {incomplete_tool}"]
+    )
+
+    assert emitted == []
+    finalization = parser.finalize_reasoning_streaming()
+    assert finalization is not None and finalization.reasoning_ended
+    assert finalization.delta is not None
+    assert finalization.delta.reasoning == "Need lookup. "
+    assert finalization.delta.content == incomplete_tool
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_streaming_without_boundary_finalizes_as_content(effort: str, k2_v3_tokenizer):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    emitted = _run_streaming_deltas(
+        parser,
+        k2_v3_tokenizer,
+        ["Answer ", "without a close token."],
+    )
+
+    assert emitted == []
+    finalization = parser.finalize_reasoning_streaming()
+    assert finalization is not None and finalization.reasoning_ended
+    assert finalization.delta is not None
+    assert finalization.delta.reasoning == ""
+    assert finalization.delta.content == "Answer without a close token."
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize(
+    "model_deltas",
+    [
+        pytest.param(["{start}", "Reasoning"], id="standalone_start"),
+        pytest.param(["{start}Reasoning"], id="start_with_text"),
+    ],
+)
+def test_streaming_optional_generated_start_is_not_emitted(
+    effort: str, model_deltas: list[str], k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    start_token = EFFORT_TOKENS[effort][0]
+    emitted = _run_streaming_deltas(
+        parser,
+        k2_v3_tokenizer,
+        [delta.format(start=start_token) for delta in model_deltas],
+    )
+
+    assert emitted == []
+    finalization = parser.finalize_reasoning_streaming()
+    assert finalization is not None and finalization.reasoning_ended
+    assert finalization.delta is not None
+    assert finalization.delta.reasoning == ""
+    assert finalization.delta.content == "Reasoning"
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_streaming_multiple_close_tokens_use_first_boundary(
+    effort: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    end_token = EFFORT_TOKENS[effort][1]
+    emitted = _run_streaming_deltas(
+        parser,
+        k2_v3_tokenizer,
+        [f"Reasoning{end_token}{end_token}Answer"],
+    )
+
+    assert [(delta.reasoning, delta.content) for delta in emitted] == [
+        ("Reasoning", f"{end_token}Answer")
+    ]
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_streaming_metadata_partition_matches_explicit_boundary(
+    effort: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    end_token = EFFORT_TOKENS[effort][1]
+    reasoning = "Need lookup."
+    content = "Answer"
+
+    emitted = _run_streaming_deltas(
+        parser,
+        k2_v3_tokenizer,
+        [reasoning, f"{end_token}{content}"],
+    )
+    partition = parser.take_reasoning_streaming_metadata_partition()
+
+    assert len(emitted) == 1
+    assert partition is not None
+    assert partition.reasoning_token_count == len(
+        k2_v3_tokenizer.tokenize(f"{reasoning}{end_token}")
+    )
+    assert partition.content_token_count == len(k2_v3_tokenizer.tokenize(content))
+    assert parser.take_reasoning_streaming_metadata_partition() is None
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_streaming_metadata_partition_matches_missing_close_tool_boundary(
+    effort: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    reasoning = "Need lookup. "
+
+    emitted = _run_streaming_deltas(
+        parser,
+        k2_v3_tokenizer,
+        [reasoning, GROUPED_TOOL_CALL],
+    )
+    finalization = parser.finalize_reasoning_streaming()
+    partition = parser.take_reasoning_streaming_metadata_partition()
+
+    assert emitted == []
+    assert finalization is not None and finalization.delta is not None
+    assert partition is not None
+    assert partition.reasoning_token_count == len(k2_v3_tokenizer.tokenize(reasoning))
+    assert partition.content_token_count == len(
+        k2_v3_tokenizer.tokenize(GROUPED_TOOL_CALL)
+    )
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_streaming_terminal_partial_plural_marker_is_finalized_as_content(
+    effort: str, k2_v3_tokenizer
+):
+    parser = _make_parser(k2_v3_tokenizer, effort)
+    emitted = _run_streaming_deltas(
+        parser,
+        k2_v3_tokenizer,
+        ["Need lookup. <ifm|tool_"],
+    )
+
+    assert emitted == []
+    finalization = parser.finalize_reasoning_streaming()
+    assert finalization is not None
+    assert finalization.reasoning_ended
+    assert finalization.delta is not None
+    assert finalization.delta.reasoning == ""
+    assert finalization.delta.content == "Need lookup. <ifm|tool_"

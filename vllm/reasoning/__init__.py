@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.reasoning.abs_reasoning_parsers import ReasoningParser, ReasoningParserManager
+from vllm.reasoning.abs_reasoning_parsers import (
+    ReasoningParser,
+    ReasoningParserManager,
+    ReasoningParserStreamingFinalization,
+    ReasoningParserStreamingMetadataPartition,
+)
 
 __all__ = [
     "ReasoningParser",
     "ReasoningParserManager",
+    "ReasoningParserStreamingFinalization",
+    "ReasoningParserStreamingMetadataPartition",
 ]
 """
 Register a lazy module mapping.

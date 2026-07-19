@@ -51,7 +51,11 @@ from vllm.entrypoints.openai.protocol import (
     ToolCall,
     UsageInfo,
 )
-from vllm.entrypoints.openai.serving_engine import OpenAIServing, clamp_prompt_logprobs
+from vllm.entrypoints.openai.serving_engine import (
+    OpenAIServing,
+    StreamingDeltaMetadata,
+    clamp_prompt_logprobs,
+)
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.entrypoints.openai.tool_parsers import ToolParser
 from vllm.entrypoints.openai.tool_parsers.mistral_tool_parser import MistralToolCall
@@ -73,6 +77,28 @@ from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
 logger = init_logger(__name__)
+
+_NORMAL_STREAM_FINISH_REASONS = frozenset({"stop", "length"})
+
+
+def _merge_streaming_delta_messages(
+    message: DeltaMessage | None,
+    extra: DeltaMessage | None,
+) -> DeltaMessage | None:
+    if extra is None:
+        return message
+    if message is None:
+        return extra
+    if extra.reasoning is not None:
+        message.reasoning = (message.reasoning or "") + extra.reasoning
+        message.reasoning_content = message.reasoning
+    if extra.content is not None:
+        message.content = (message.content or "") + extra.content
+    if extra.tool_calls:
+        # Assignment matters for Pydantic's exclude_unset serialization. A
+        # list mutation alone does not mark tool_calls as explicitly set.
+        message.tool_calls = [*message.tool_calls, *extra.tool_calls]
+    return message
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -550,6 +576,11 @@ class OpenAIServingChat(OpenAIServing):
             ]
             harmony_tools_streamed = [False] * num_choices
         tools_streamed = [False] * num_choices
+        pending_metadata = [
+            StreamingDeltaMetadata(include_logprobs=bool(request.logprobs))
+            for _ in range(num_choices)
+        ]
+        pending_delta_messages: list[DeltaMessage | None] = [None] * num_choices
 
         if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
             tool_choice_function_name = request.tool_choice.function.name
@@ -585,10 +616,15 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             if self.reasoning_parser:
-                reasoning_parser = self.reasoning_parser(
-                    tokenizer,
-                    chat_template_kwargs=request.chat_template_kwargs,  # type: ignore
-                )
+                reasoning_parsers = [
+                    self.reasoning_parser(
+                        tokenizer,
+                        chat_template_kwargs=request.chat_template_kwargs,  # type: ignore
+                    )
+                    for _ in range(num_choices)
+                ]
+            else:
+                reasoning_parsers = [None] * num_choices
         except RuntimeError as e:
             logger.exception("Error in reasoning parser creation.")
             data = self.create_streaming_error_response(str(e))
@@ -604,7 +640,8 @@ class OpenAIServingChat(OpenAIServing):
                         tokenizer,
                         chat_template_kwargs=request.chat_template_kwargs,
                     )
-                ] * num_choices
+                    for _ in range(num_choices)
+                ]
             else:
                 tool_parsers = [None] * num_choices
         except Exception as e:
@@ -713,21 +750,10 @@ class OpenAIServingChat(OpenAIServing):
                 for output in res.outputs:
                     i = output.index
                     tool_parser = tool_parsers[i]
+                    reasoning_parser = reasoning_parsers[i]
 
                     if finish_reason_sent[i]:
                         continue
-
-                    if request.logprobs and request.top_logprobs is not None:
-                        assert output.logprobs is not None, "Did not output logprobs"
-                        logprobs = self._create_chat_logprobs(
-                            token_ids=output.token_ids,
-                            top_logprobs=output.logprobs,
-                            tokenizer=tokenizer,
-                            num_output_top_logprobs=request.top_logprobs,
-                            return_as_token_id=request.return_tokens_as_token_ids,
-                        )
-                    else:
-                        logprobs = None
 
                     if self.use_harmony:
                         harmony_parser = harmony_parsers[i]
@@ -738,8 +764,19 @@ class OpenAIServingChat(OpenAIServing):
                             delta_text += harmony_parser.last_content_delta or ""
                         cur_channel = harmony_parser.current_channel
                         cur_recipient = harmony_parser.current_recipient
+                        metadata_is_visible = (
+                            cur_channel != "analysis" or request.include_reasoning
+                        )
                     else:
                         delta_text = output.text
+                        metadata_is_visible = True
+
+                    output_token_ids = as_list(output.token_ids)
+                    if metadata_is_visible:
+                        pending_metadata[i].append(
+                            output_token_ids,
+                            output.logprobs,
+                        )
 
                     if (
                         not delta_text
@@ -993,6 +1030,34 @@ class OpenAIServingChat(OpenAIServing):
                                 else:
                                     current_text = ""
 
+                            if (
+                                output.finish_reason in _NORMAL_STREAM_FINISH_REASONS
+                                and not reasoning_end_arr[i]
+                            ):
+                                finalization = (
+                                    reasoning_parser.finalize_reasoning_streaming()
+                                )
+                                if finalization is not None:
+                                    if finalization.reasoning_ended:
+                                        reasoning_end_arr[i] = True
+                                        finalized_delta = finalization.delta
+                                        current_text = (
+                                            finalized_delta.content
+                                            if finalized_delta is not None
+                                            and finalized_delta.content is not None
+                                            else ""
+                                        )
+                                        current_token_ids = []
+                                        if finalized_delta is not None:
+                                            finalized_delta.content = None
+                                        delta_message = _merge_streaming_delta_messages(
+                                            delta_message, finalized_delta
+                                        )
+                                    else:
+                                        delta_message = _merge_streaming_delta_messages(
+                                            delta_message, finalization.delta
+                                        )
+
                         # Feed any post-reasoning text to the tool parser
                         # immediately. The engine might finish in this same
                         # iteration, so there may not be another delta.
@@ -1026,6 +1091,13 @@ class OpenAIServingChat(OpenAIServing):
                                     )
                             if tool_delta_message and tool_delta_message.tool_calls:
                                 tools_streamed[i] = True
+                            if output.finish_reason in _NORMAL_STREAM_FINISH_REASONS:
+                                tool_final_delta = (
+                                    tool_parser.finalize_tool_calls_streaming(request)
+                                )
+                                delta_message = _merge_streaming_delta_messages(
+                                    delta_message, tool_final_delta
+                                )
                     # when only tool calls
                     elif tool_choice_auto:
                         assert tool_parser is not None
@@ -1040,6 +1112,13 @@ class OpenAIServingChat(OpenAIServing):
                         )
                         if delta_message and delta_message.tool_calls:
                             tools_streamed[i] = True
+                        if output.finish_reason in _NORMAL_STREAM_FINISH_REASONS:
+                            tool_final_delta = (
+                                tool_parser.finalize_tool_calls_streaming(request)
+                            )
+                            delta_message = _merge_streaming_delta_messages(
+                                delta_message, tool_final_delta
+                            )
 
                     # when only reasoning
                     elif self.reasoning_parser:
@@ -1051,6 +1130,14 @@ class OpenAIServingChat(OpenAIServing):
                             current_token_ids,
                             output.token_ids,
                         )
+                        if output.finish_reason in _NORMAL_STREAM_FINISH_REASONS:
+                            finalization = (
+                                reasoning_parser.finalize_reasoning_streaming()
+                            )
+                            if finalization is not None:
+                                delta_message = _merge_streaming_delta_messages(
+                                    delta_message, finalization.delta
+                                )
                     # handle streaming just a content delta
                     else:
                         delta_message = DeltaMessage(content=delta_text)
@@ -1071,6 +1158,27 @@ class OpenAIServingChat(OpenAIServing):
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
 
+                    # A tool parser can hold part of an engine delta after the
+                    # reasoning parser has already produced another part. Hold
+                    # that semantic delta too, so its metadata is released only
+                    # with the complete message produced from the same source
+                    # tokens.
+                    delta_message = _merge_streaming_delta_messages(
+                        pending_delta_messages[i], delta_message
+                    )
+                    pending_delta_messages[i] = None
+                    if (
+                        tool_parser is not None
+                        and tool_parser.has_pending_streaming_output()
+                    ):
+                        if output.finish_reason is None:
+                            pending_delta_messages[i] = delta_message
+                            continue
+                        # Aborts and other non-normal terminal states must not
+                        # expose a partial semantic delta or its metadata.
+                        pending_metadata[i].clear()
+                        delta_message = DeltaMessage()
+
                     # if the message delta is None (e.g. because it was a
                     # "control token" for tool calls or the parser otherwise
                     # wasn't ready to send a token, then
@@ -1080,6 +1188,38 @@ class OpenAIServingChat(OpenAIServing):
                             continue
                         else:
                             delta_message = DeltaMessage()
+
+                    has_semantic_delta = (
+                        delta_message.reasoning is not None
+                        or delta_message.content is not None
+                        or bool(delta_message.tool_calls)
+                    )
+                    has_visible_delta = bool(
+                        delta_message.reasoning
+                        or delta_message.content
+                        or delta_message.tool_calls
+                    )
+                    if output.finish_reason == "abort" and not has_visible_delta:
+                        pending_metadata[i].clear()
+                        emitted_token_ids: list[int] = []
+                        logprobs = None
+                    elif has_semantic_delta:
+                        emitted_token_ids, emitted_raw_logprobs = pending_metadata[
+                            i
+                        ].take()
+                        if request.logprobs:
+                            logprobs = self._create_chat_logprobs(
+                                token_ids=emitted_token_ids,
+                                top_logprobs=emitted_raw_logprobs,
+                                tokenizer=tokenizer,
+                                num_output_top_logprobs=request.top_logprobs,
+                                return_as_token_id=request.return_tokens_as_token_ids,
+                            )
+                        else:
+                            logprobs = None
+                    else:
+                        emitted_token_ids = []
+                        logprobs = None
 
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
@@ -1097,7 +1237,7 @@ class OpenAIServingChat(OpenAIServing):
                             self.request_logger.log_outputs(
                                 request_id=request_id,
                                 outputs=delta_content,
-                                output_token_ids=as_list(output.token_ids),
+                                output_token_ids=emitted_token_ids,
                                 finish_reason=output.finish_reason,
                                 is_streaming=True,
                                 delta=True,
@@ -1111,9 +1251,7 @@ class OpenAIServingChat(OpenAIServing):
                             logprobs=logprobs,
                             finish_reason=None,
                             token_ids=(
-                                as_list(output.token_ids)
-                                if request.return_token_ids
-                                else None
+                                emitted_token_ids if request.return_token_ids else None
                             ),
                         )
 
@@ -1219,9 +1357,7 @@ class OpenAIServingChat(OpenAIServing):
                             finish_reason=finish_reason_,
                             stop_reason=output.stop_reason,
                             token_ids=(
-                                as_list(output.token_ids)
-                                if request.return_token_ids
-                                else None
+                                emitted_token_ids if request.return_token_ids else None
                             ),
                         )
 

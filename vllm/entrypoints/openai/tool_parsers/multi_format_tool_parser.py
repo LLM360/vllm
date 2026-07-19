@@ -70,6 +70,7 @@ class MultiFormatToolParser(ToolParser):
     )
 
     _IFM_TOOL_CALLS_START_TOKEN = "<ifm|tool_calls>"
+    _IFM_TOOL_CALLS_END_TOKEN = "</ifm|tool_calls>"
     _IFM_TOOL_CALL_START_TOKEN = "<ifm|tool_call>"
     _IFM_BLOCK_REGEX = re.compile(
         r"<ifm\|tool_call>(.*?)</ifm\|tool_call>",
@@ -211,6 +212,26 @@ class MultiFormatToolParser(ToolParser):
 
         return self._extract_tool_calls_streaming_fallback(delta_text, request)
 
+    def finalize_tool_calls_streaming(
+        self, request: ChatCompletionRequest
+    ) -> DeltaMessage | None:
+        if self._delegate is not None:
+            return self._delegate.finalize_tool_calls_streaming(request)
+        if not self._streaming_content_buffer:
+            return None
+        if self._streaming_tool_calls_emitted:
+            return None
+        content = self._streaming_content_buffer
+        self._streaming_content_buffer = ""
+        return DeltaMessage(content=content)
+
+    def has_pending_streaming_output(self) -> bool:
+        if self._delegate is not None:
+            return self._delegate.has_pending_streaming_output()
+        return bool(
+            self._streaming_content_buffer and not self._streaming_tool_calls_emitted
+        )
+
     def _tool_call_markers(self) -> tuple[str, ...]:
         if self.tool_format in {"json", "xml", "xml_typed"}:
             return (
@@ -254,6 +275,8 @@ class MultiFormatToolParser(ToolParser):
         request: ChatCompletionRequest,
         content: str | None = None,
     ) -> DeltaMessage | None:
+        if not self._streaming_input_complete():
+            return DeltaMessage(content=content) if content is not None else None
         parsed = self.extract_tool_calls(self._streaming_content_buffer, request)
         if not parsed.tools_called or not parsed.tool_calls:
             return DeltaMessage(content=content) if content is not None else None
@@ -278,6 +301,9 @@ class MultiFormatToolParser(ToolParser):
             self._streaming_tool_calls_emitted += 1
 
         return DeltaMessage(content=content, tool_calls=tool_call_deltas)
+
+    def _streaming_input_complete(self) -> bool:
+        return True
 
     def _extract_tool_calls_streaming_fallback(
         self, delta_text: str, request: ChatCompletionRequest
@@ -534,8 +560,7 @@ class MultiFormatToolParser(ToolParser):
                     target_type = schema_arg_type or explicit_arg_type
                     value_for_coercion = (
                         value
-                        if self._arg_type_is_string(target_type)
-                        or target_type == "any"
+                        if self._arg_type_is_string(target_type) or target_type == "any"
                         else value.strip()
                     )
                     arg_value = self._coerce_argument_value(
@@ -843,12 +868,46 @@ class K2V3ToolParser(MultiFormatToolParser):
             return (self._IFM_TOOL_CALLS_START_TOKEN, "<tool_call>")
         return super()._tool_call_markers()
 
+    def _streaming_input_complete(self) -> bool:
+        if self._IFM_TOOL_CALLS_START_TOKEN in self._streaming_content_buffer:
+            return self._IFM_TOOL_CALLS_END_TOKEN in self._streaming_content_buffer
+        return super()._streaming_input_complete()
+
     def extract_tool_calls(
         self,
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
-        extracted = super().extract_tool_calls(model_output, request)
+        uses_ifm_format = self.tool_format in {"json", "xml", "xml_typed"}
+        contains_ifm_marker = (
+            self._IFM_TOOL_CALLS_START_TOKEN in model_output
+            or self._IFM_TOOL_CALL_START_TOKEN in model_output
+        )
+        if uses_ifm_format or (self.tool_format == "glm" and contains_ifm_marker):
+            wrapper_start = model_output.find(self._IFM_TOOL_CALLS_START_TOKEN)
+            wrapper_end = model_output.find(
+                self._IFM_TOOL_CALLS_END_TOKEN,
+                wrapper_start + len(self._IFM_TOOL_CALLS_START_TOKEN),
+            )
+            if wrapper_start == -1 or wrapper_end == -1:
+                return ExtractedToolCallInformation(
+                    tools_called=False,
+                    tool_calls=[],
+                    content=model_output,
+                )
+            wrapper_end += len(self._IFM_TOOL_CALLS_END_TOKEN)
+            extracted = super().extract_tool_calls(
+                model_output[wrapper_start:wrapper_end], request
+            )
+            if not extracted.tools_called:
+                return ExtractedToolCallInformation(
+                    tools_called=False,
+                    tool_calls=[],
+                    content=model_output,
+                )
+            extracted.content = self._prefix_content(model_output, wrapper_start)
+        else:
+            extracted = super().extract_tool_calls(model_output, request)
         if extracted.tools_called and extracted.content is None:
             extracted.content = ""
         return extracted

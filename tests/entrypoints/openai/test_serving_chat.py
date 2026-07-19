@@ -426,10 +426,15 @@ def test_async_serving_chat_init():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "model_deltas",
+    "model_deltas, expected_content, expected_reasoning, expected_finish, "
+    "expected_token_chunks",
     [
         pytest.param(
             [("</ifm|think>\n{tool_call}", [2, 3], "stop")],
+            "\n",
+            [""],
+            "tool_calls",
+            [[2, 3]],
             id="same_delta",
         ),
         pytest.param(
@@ -437,13 +442,190 @@ def test_async_serving_chat_init():
                 ("</ifm|think>", [2], None),
                 ("\n{tool_call}", [3], "stop"),
             ],
+            "\n",
+            [""],
+            "tool_calls",
+            [[2], [3]],
             id="split_deltas",
+        ),
+        pytest.param(
+            [("{tool_call}", [3], "stop")],
+            "",
+            [""],
+            "tool_calls",
+            [[3]],
+            id="missing_close_stop",
+        ),
+        pytest.param(
+            [("{tool_call}", [3], "length")],
+            "",
+            [""],
+            "tool_calls",
+            [[3]],
+            id="missing_close_length",
+        ),
+        pytest.param(
+            [("Need lookup. {tool_call}", [31, 3], "stop")],
+            "",
+            ["Need lookup. "],
+            "tool_calls",
+            [[31, 3]],
+            id="missing_close_reasoning_and_complete_tool",
+        ),
+        pytest.param(
+            [
+                ("Plain answer ", [31, 32], None),
+                ("without close.", [33], "stop"),
+            ],
+            "Plain answer without close.",
+            [""],
+            "stop",
+            [[31, 32, 33]],
+            id="plain_missing_close_stop",
+        ),
+        pytest.param(
+            [
+                ("Plain answer ", [31, 32], None),
+                ("without close.", [33], "length"),
+            ],
+            "Plain answer without close.",
+            [""],
+            "length",
+            [[31, 32, 33]],
+            id="plain_missing_close_length",
+        ),
+        pytest.param(
+            [("{tool_call}", [3], "abort")],
+            "",
+            [],
+            "abort",
+            [],
+            id="missing_close_abort_not_finalized",
+        ),
+        pytest.param(
+            [
+                (
+                    "</ifm|think><ifm|tool_calls><ifm|tool_call>get_weather",
+                    [2, 3],
+                    "abort",
+                )
+            ],
+            "",
+            [],
+            "abort",
+            [],
+            id="abort_does_not_flush_incomplete_tool_markup",
+        ),
+        pytest.param(
+            [
+                (
+                    "Need lookup.</ifm|think><ifm|tool_calls>"
+                    "<ifm|tool_call>get_weather",
+                    [31, 2, 3],
+                    None,
+                ),
+                (
+                    "<ifm|arg_key>city</ifm|arg_key>"
+                    "<ifm|arg_value>Tokyo</ifm|arg_value>"
+                    "</ifm|tool_call></ifm|tool_calls>",
+                    [4],
+                    "stop",
+                ),
+            ],
+            "",
+            ["Need lookup."],
+            "tool_calls",
+            [[31, 2, 3, 4]],
+            id="mixed_reasoning_and_buffered_tool_metadata_stays_together",
+        ),
+        pytest.param(
+            [
+                (
+                    "Need lookup. <ifm|tool_calls><ifm|tool_call>get_weather",
+                    [3],
+                    "length",
+                )
+            ],
+            "<ifm|tool_calls><ifm|tool_call>get_weather",
+            ["Need lookup. "],
+            "length",
+            [[3]],
+            id="missing_close_incomplete_length",
+        ),
+        pytest.param(
+            [
+                (
+                    "Need lookup.</ifm|think><ifm|tool_calls>"
+                    "<ifm|tool_call>get_weather",
+                    [31, 2, 3],
+                    "stop",
+                )
+            ],
+            "<ifm|tool_calls><ifm|tool_call>get_weather",
+            ["Need lookup."],
+            "stop",
+            [[31, 2, 3]],
+            id="explicit_close_incomplete_tool_is_content",
+        ),
+        pytest.param(
+            [
+                ("Maybe {tool_call}", [3], None),
+                (" reconsider</ifm|think>{tool_call}", [2, 3], "stop"),
+            ],
+            "",
+            ["Maybe {tool_call} reconsider"],
+            "tool_calls",
+            [[3, 2, 3]],
+            id="delayed_explicit_close",
+        ),
+        pytest.param(
+            [
+                (
+                    "Need lookup.</ifm|think></ifm|think>Answer",
+                    [31, 2, 2, 32],
+                    "stop",
+                )
+            ],
+            "</ifm|think>Answer",
+            ["Need lookup."],
+            "stop",
+            [[31, 2, 2, 32]],
+            id="multiple_close_tokens",
+        ),
+        pytest.param(
+            [
+                (
+                    "Need lookup. <ifm|tool_call>get_weather"
+                    "<ifm|arg_key>city</ifm|arg_key>"
+                    "<ifm|arg_value>Tokyo</ifm|arg_value>"
+                    "</ifm|tool_call>",
+                    [31, 3],
+                    "stop",
+                )
+            ],
+            (
+                "Need lookup. <ifm|tool_call>get_weather"
+                "<ifm|arg_key>city</ifm|arg_key>"
+                "<ifm|arg_value>Tokyo</ifm|arg_value>"
+                "</ifm|tool_call>"
+            ),
+            [""],
+            "stop",
+            [[31, 3]],
+            id="singular_tool_tag_remains_content",
         ),
     ],
 )
-async def test_streaming_reasoning_end_and_k2_tool_call(model_deltas):
+async def test_streaming_reasoning_end_and_k2_tool_call(
+    model_deltas,
+    expected_content,
+    expected_reasoning,
+    expected_finish,
+    expected_token_chunks,
+):
     from vllm.entrypoints.openai.protocol import RequestResponseMetadata
     from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+    from vllm.logprobs import Logprob
     from vllm.outputs import CompletionOutput, RequestOutput
     from vllm.reasoning import ReasoningParserManager
 
@@ -463,6 +645,11 @@ async def test_streaming_reasoning_end_and_k2_tool_call(model_deltas):
                 "</ifm|think>": 2,
             }
 
+        def decode(self, token_id):
+            if isinstance(token_id, list):
+                return "".join(f"token-{item}" for item in token_id)
+            return f"token-{token_id}"
+
     async def result_generator():
         for text, token_ids, finish_reason in model_deltas:
             yield RequestOutput(
@@ -476,7 +663,15 @@ async def test_streaming_reasoning_end_and_k2_tool_call(model_deltas):
                         text=text.format(tool_call=tool_call),
                         token_ids=token_ids,
                         cumulative_logprob=0.0,
-                        logprobs=None,
+                        logprobs=[
+                            {
+                                token_id: Logprob(
+                                    logprob=-0.1,
+                                    decoded_token=f"token-{token_id}",
+                                )
+                            }
+                            for token_id in token_ids
+                        ],
                         finish_reason=finish_reason,
                         stop_reason=None,
                     )
@@ -495,6 +690,8 @@ async def test_streaming_reasoning_end_and_k2_tool_call(model_deltas):
     serving_chat.enable_log_outputs = False
     serving_chat.request_logger = None
     serving_chat.response_role = "assistant"
+    serving_chat.return_tokens_as_token_ids = False
+    serving_chat.log_error_stack = False
 
     request = ChatCompletionRequest(
         model="test-model",
@@ -514,6 +711,9 @@ async def test_streaming_reasoning_end_and_k2_tool_call(model_deltas):
         ],
         tool_choice="auto",
         stream=True,
+        logprobs=True,
+        top_logprobs=1,
+        return_token_ids=True,
         chat_template_kwargs={"tool_call_format": "xml"},
     )
     chunks = []
@@ -553,15 +753,95 @@ async def test_streaming_reasoning_end_and_k2_tool_call(model_deltas):
         if chunk["choices"]
     )
 
-    assert reasoning_deltas == [""]
-    assert reasoning_content_deltas == [""]
-    assert content == "\n"
-    assert final_choice["finish_reason"] == "tool_calls"
-    assert len(delta["tool_calls"]) == 1
-    streamed_tool_call = delta["tool_calls"][0]
-    assert streamed_tool_call["id"]
-    assert streamed_tool_call["function"]["name"] == "get_weather"
-    assert json.loads(streamed_tool_call["function"]["arguments"]) == {"city": "Tokyo"}
+    expected_reasoning = [
+        reasoning.format(tool_call=tool_call) for reasoning in expected_reasoning
+    ]
+    assert reasoning_deltas == expected_reasoning
+    assert reasoning_content_deltas == expected_reasoning
+    assert content == expected_content
+    assert final_choice["finish_reason"] == expected_finish
+    metadata_choices = [
+        chunk["choices"][0]
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0].get("token_ids")
+    ]
+    assert [choice["token_ids"] for choice in metadata_choices] == (
+        expected_token_chunks
+    )
+    for choice in metadata_choices:
+        assert len(choice["logprobs"]["content"]) == len(choice["token_ids"])
+    if expected_finish == "tool_calls":
+        assert len(delta["tool_calls"]) == 1
+        streamed_tool_call = delta["tool_calls"][0]
+        assert streamed_tool_call["id"]
+        assert streamed_tool_call["function"]["name"] == "get_weather"
+        assert json.loads(streamed_tool_call["function"]["arguments"]) == {
+            "city": "Tokyo"
+        }
+        if len(expected_token_chunks) == 1:
+            assert final_choice["token_ids"] == expected_token_chunks[0]
+            assert final_choice["delta"].get("reasoning") == expected_reasoning[0]
+    else:
+        assert not delta.get("tool_calls")
+
+    if expected_finish != "abort":
+        from vllm.entrypoints.openai.serving_engine import OpenAIServing
+
+        model_output = "".join(
+            text.format(tool_call=tool_call) for text, _, _ in model_deltas
+        )
+        nonstream_reasoning_parser = ReasoningParserManager.get_reasoning_parser(
+            "k2_v3"
+        )(
+            FakeK2Tokenizer(),
+            chat_template_kwargs={"reasoning_effort": "high"},
+        )
+        nonstream_reasoning, raw_nonstream_content = (
+            nonstream_reasoning_parser.extract_reasoning(model_output, request)
+        )
+        nonstream_calls, nonstream_content = (
+            OpenAIServing._parse_tool_calls_from_content(
+                request=request,
+                tokenizer=FakeK2Tokenizer(),
+                content=raw_nonstream_content,
+                enable_auto_tools=True,
+                tool_parser_cls=ToolParserManager.get_tool_parser("k2_v3"),
+                chat_template_kwargs={"tool_call_format": "xml"},
+            )
+        )
+        streamed_calls = [
+            tool
+            for chunk in chunks
+            if chunk["choices"]
+            for tool in chunk["choices"][0]["delta"].get("tool_calls", [])
+        ]
+
+        assert "".join(reasoning_deltas) == nonstream_reasoning
+        assert content == nonstream_content
+        assert [
+            (
+                tool["function"]["name"],
+                json.loads(tool["function"]["arguments"]),
+            )
+            for tool in streamed_calls
+        ] == [(call.name, json.loads(call.arguments)) for call in nonstream_calls or []]
+
+
+def test_streaming_metadata_accumulators_are_choice_isolated():
+    from vllm.entrypoints.openai.serving_engine import StreamingDeltaMetadata
+    from vllm.logprobs import Logprob
+
+    accumulators = [StreamingDeltaMetadata(include_logprobs=True) for _ in range(2)]
+    accumulators[0].append([1, 2], [{1: Logprob(-0.1)}, {2: Logprob(-0.2)}])
+    accumulators[1].append([10], [{10: Logprob(-1.0)}])
+
+    choice_zero_ids, choice_zero_logprobs = accumulators[0].take()
+
+    assert choice_zero_ids == [1, 2]
+    assert [next(iter(item)) for item in choice_zero_logprobs] == [1, 2]
+    assert accumulators[0].token_ids == []
+    assert accumulators[1].token_ids == [10]
+    assert [next(iter(item)) for item in accumulators[1].logprobs] == [10]
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,7 @@ CALL_2 = (
     "</ifm|tool_call>"
 )
 GROUPED_CALL_1 = f"<ifm|tool_calls>{CALL_1}</ifm|tool_calls>"
+GROUPED_CALLS = f"<ifm|tool_calls>{CALL_1}{CALL_2}</ifm|tool_calls>"
 
 
 class FakeTokenizer:
@@ -326,11 +327,11 @@ def test_k2_v3_parser_alias_uses_ifm_formats():
 
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        "<ifm|tool_call>study_args\n"
+        "<ifm|tool_calls><ifm|tool_call>study_args\n"
         "<ifm|arg_key>user_id</ifm|arg_key>"
         "<ifm|arg_type>string</ifm|arg_type>"
         "<ifm|arg_value>12345</ifm|arg_value>"
-        "</ifm|tool_call>",
+        "</ifm|tool_call></ifm|tool_calls>",
         make_request(),
     )
 
@@ -399,10 +400,10 @@ def test_k2_v3_parser_does_not_strip_legacy_reasoning_prefix():
     extracted = run_tool_extraction_nonstreaming(
         parser,
         "<think>legacy reasoning</think>\n"
-        "<ifm|tool_call>get_weather"
+        "<ifm|tool_calls><ifm|tool_call>get_weather"
         "<ifm|arg_key>city</ifm|arg_key>"
         "<ifm|arg_value>Tokyo</ifm|arg_value>"
-        "</ifm|tool_call>",
+        "</ifm|tool_call></ifm|tool_calls>",
         make_request(),
     )
 
@@ -651,6 +652,88 @@ def test_k2_v3_streaming_requires_grouped_ifm_tool_calls():
     assert reconstructed.tool_calls == []
 
 
+def test_k2_v3_nonstreaming_requires_grouped_ifm_tool_calls():
+    parser = make_k2_parser()
+
+    extracted = run_tool_extraction_nonstreaming(parser, CALL_1, make_request())
+
+    assert not extracted.tools_called
+    assert extracted.tool_calls == []
+    assert extracted.content == CALL_1
+
+
+def test_k2_v3_nonstreaming_requires_closed_grouped_ifm_tool_calls():
+    parser = make_k2_parser()
+    incomplete_group = "<ifm|tool_calls>" + CALL_1
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser, incomplete_group, make_request()
+    )
+
+    assert not extracted.tools_called
+    assert extracted.tool_calls == []
+    assert extracted.content == incomplete_group
+
+
+@pytest.mark.parametrize(
+    "wrapped_content",
+    [
+        pytest.param("", id="empty_wrapper"),
+        pytest.param(
+            "<ifm|tool_call>get_weather",
+            id="incomplete_inner_call",
+        ),
+    ],
+)
+def test_k2_v3_nonstreaming_invalid_closed_group_preserves_full_content(
+    wrapped_content: str,
+):
+    parser = make_k2_parser()
+    model_output = (
+        "Content prefix. "
+        f"<ifm|tool_calls>{wrapped_content}</ifm|tool_calls>"
+        " Content suffix."
+    )
+
+    extracted = run_tool_extraction_nonstreaming(parser, model_output, make_request())
+
+    assert not extracted.tools_called
+    assert extracted.tool_calls == []
+    assert extracted.content == model_output
+
+
+@pytest.mark.parametrize(
+    "grouped_calls, expected_names",
+    [
+        pytest.param(GROUPED_CALL_1, ["get_weather"], id="single"),
+        pytest.param(
+            GROUPED_CALLS,
+            ["get_weather", "get_time"],
+            id="multiple",
+        ),
+    ],
+)
+def test_k2_v3_nonstreaming_parses_only_closed_grouped_ifm_tool_calls(
+    grouped_calls: str, expected_names: list[str]
+):
+    parser = make_k2_parser()
+
+    extracted = run_tool_extraction_nonstreaming(parser, grouped_calls, make_request())
+
+    assert extracted.tools_called
+    assert extracted.content == ""
+    assert [call.function.name for call in extracted.tool_calls] == expected_names
+
+
+def test_multi_format_nonstreaming_keeps_singular_ifm_compatibility():
+    parser = make_parser("xml")
+
+    extracted = run_tool_extraction_nonstreaming(parser, CALL_1, make_request())
+
+    assert extracted.tools_called
+    assert [call.function.name for call in extracted.tool_calls] == ["get_weather"]
+
+
 def test_k2_v3_streaming_parses_grouped_ifm_tool_calls():
     parser = make_k2_parser()
 
@@ -662,6 +745,41 @@ def test_k2_v3_streaming_parses_grouped_ifm_tool_calls():
 
     assert reconstructed.other_content == ""
     assert [call.function.name for call in reconstructed.tool_calls] == ["get_weather"]
+
+
+def test_k2_v3_streaming_waits_for_complete_group_before_emitting_calls():
+    parser = make_k2_parser()
+    request = make_request()
+
+    reconstructed = run_tool_extraction_streaming(
+        parser,
+        ["<ifm|tool_calls>" + CALL_1],
+        request,
+    )
+
+    assert reconstructed.tool_calls == []
+    assert parser.has_pending_streaming_output()
+    final_delta = parser.finalize_tool_calls_streaming(request)
+    assert final_delta is not None
+    assert final_delta.content == "<ifm|tool_calls>" + CALL_1
+    assert final_delta.tool_calls == []
+    assert not parser.has_pending_streaming_output()
+
+
+def test_k2_v3_streaming_preserves_multiple_complete_calls():
+    parser = make_k2_parser()
+
+    reconstructed = run_tool_extraction_streaming(
+        parser,
+        [GROUPED_CALLS],
+        make_request(),
+        assert_one_tool_per_delta=False,
+    )
+
+    assert [call.function.name for call in reconstructed.tool_calls] == [
+        "get_weather",
+        "get_time",
+    ]
 
 
 def test_readme_json_example():

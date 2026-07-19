@@ -118,6 +118,16 @@ class ToolParser:
             "AbstractToolParser.extract_tool_calls_streaming has not been implemented!"
         )
 
+    def finalize_tool_calls_streaming(
+        self, request: ChatCompletionRequest
+    ) -> DeltaMessage | None:
+        """Release parser-held text after normal model completion."""
+        return None
+
+    def has_pending_streaming_output(self) -> bool:
+        """Whether source text is still held without a complete output delta."""
+        return False
+
 
 class ToolParserManager:
     """

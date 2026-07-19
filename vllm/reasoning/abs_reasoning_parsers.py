@@ -5,6 +5,7 @@ import importlib
 import os
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +28,32 @@ else:
     TokenizerLike = Any
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class ReasoningParserStreamingFinalization:
+    """A delta held by a reasoning parser until normal stream completion.
+
+    ``reasoning_ended`` is an explicit control signal.  In particular, callers
+    must not infer a reasoning transition from whether ``delta.content`` is an
+    empty string or ``None``.
+    """
+
+    delta: DeltaMessage | None = None
+    reasoning_ended: bool = False
+
+
+@dataclass(frozen=True)
+class ReasoningParserStreamingMetadataPartition:
+    """Source-token counts for one emitted reasoning-parser delta.
+
+    Reasoning metadata comes first in the source token stream, followed by
+    content metadata. Tokens for stripped reasoning delimiters belong to the
+    reasoning side so they can never be mislabeled as output content.
+    """
+
+    reasoning_token_count: int = 0
+    content_token_count: int = 0
 
 
 class ReasoningParser:
@@ -126,6 +153,23 @@ class ReasoningParser:
         Instance method that is implemented for preparing the structured tag
         Otherwise, None is returned
         """
+        return None
+
+    def finalize_reasoning_streaming(
+        self,
+    ) -> ReasoningParserStreamingFinalization | None:
+        """Release text held during streaming after normal model completion.
+
+        The serving layer calls this only for an engine output with a terminal
+        finish reason.  Cancellation, disconnect, and generator cleanup do not
+        finalize parser state.
+        """
+        return None
+
+    def take_reasoning_streaming_metadata_partition(
+        self,
+    ) -> ReasoningParserStreamingMetadataPartition | None:
+        """Return and clear source-token counts for the most recent delta."""
         return None
 
 

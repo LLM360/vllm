@@ -92,7 +92,10 @@ from vllm.entrypoints.openai.protocol import (
     ResponseUsage,
     StreamingResponsesResponse,
 )
-from vllm.entrypoints.openai.serving_engine import OpenAIServing
+from vllm.entrypoints.openai.serving_engine import (
+    OpenAIServing,
+    StreamingDeltaMetadata,
+)
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.entrypoints.responses_utils import (
     construct_input_messages,
@@ -105,11 +108,14 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob as SampleLogprob
 from vllm.logprobs import SampleLogprobs
 from vllm.outputs import CompletionOutput
+from vllm.reasoning import ReasoningParserStreamingMetadataPartition
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
+
+_NORMAL_STREAM_FINISH_REASONS = frozenset({"stop", "length"})
 
 
 def _extract_allowed_tools_from_mcp_requests(
@@ -1190,302 +1196,276 @@ class OpenAIServingResponses(OpenAIServing):
             [StreamingResponsesResponse], StreamingResponsesResponse
         ],
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
-        current_content_index = 0
-        current_output_index = 0
-        current_item_id = ""
-        reasoning_parser = None
-        if self.reasoning_parser:
-            reasoning_parser = self.reasoning_parser(tokenizer)
+        del sampling_params, context, model_name, request_metadata, created_time
+        reasoning_parser = (
+            self.reasoning_parser(tokenizer) if self.reasoning_parser else None
+        )
         previous_text = ""
         previous_token_ids: list[int] = []
-        first_delta_sent = False
-        previous_delta_messages: list[DeltaMessage] = []
-        async for ctx in result_generator:
-            assert isinstance(ctx, SimpleContext)
-            if ctx.last_output is None:
-                continue
-            if ctx.last_output.outputs:
-                output = ctx.last_output.outputs[0]
-                if reasoning_parser:
-                    delta_message = reasoning_parser.extract_reasoning_streaming(
-                        previous_text=previous_text,
-                        current_text=previous_text + output.text,
-                        delta_text=output.text,
-                        previous_token_ids=previous_token_ids,
-                        current_token_ids=previous_token_ids + output.token_ids,
-                        delta_token_ids=output.token_ids,
-                    )
-                else:
-                    delta_message = DeltaMessage(
-                        content=output.text,
-                    )
-                previous_text += output.text
-                previous_token_ids += output.token_ids
-                if not delta_message:
-                    continue
-                if delta_message.reasoning == "":
-                    # Some parsers use empty reasoning to mark a reasoning
-                    # boundary. The parser state above must still be advanced,
-                    # but the empty value is not user-visible reasoning.
-                    delta_message.reasoning = None
-                    delta_message.reasoning_content = None
-                    if delta_message.content is None and not delta_message.tool_calls:
-                        continue
-                if not first_delta_sent:
-                    current_item_id = str(uuid.uuid4())
-                    if delta_message.reasoning:
-                        yield _increment_sequence_number_and_return(
-                            ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=current_output_index,
-                                item=ResponseReasoningItem(
-                                    type="reasoning",
-                                    id=current_item_id,
-                                    summary=[],
-                                    status="in_progress",
-                                ),
-                            )
-                        )
-                    else:
-                        yield _increment_sequence_number_and_return(
-                            ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=current_output_index,
-                                item=ResponseOutputMessage(
-                                    id=current_item_id,
-                                    type="message",
-                                    role="assistant",
-                                    content=[],
-                                    status="in_progress",
-                                ),
-                            )
-                        )
-                    yield _increment_sequence_number_and_return(
-                        ResponseContentPartAddedEvent(
-                            type="response.content_part.added",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                            content_index=current_content_index,
-                            part=ResponseOutputText(
-                                type="output_text",
-                                text="",
-                                annotations=[],
-                                logprobs=[],
-                            ),
-                        )
-                    )
-                    current_content_index += 1
-                    first_delta_sent = True
-                # todo(kebe7jun) tool call support
+        pending_metadata = StreamingDeltaMetadata(
+            include_logprobs=request.is_include_output_logprobs()
+        )
+        current_output_index = 0
+        current_content_index = 0
+        current_item_id = ""
+        current_kind: str | None = None
+        current_text_parts: list[str] = []
 
-                # check delta message and previous delta message are
-                # same as content or reasoning content
-                if (
-                    previous_delta_messages
-                    and previous_delta_messages[-1].reasoning is not None
-                    and delta_message.content is not None
-                ):
-                    # from reasoning to normal content, send done
-                    # event for reasoning
-                    reason_content = "".join(
-                        pm.reasoning
-                        for pm in previous_delta_messages
-                        if pm.reasoning is not None
-                    )
-                    yield _increment_sequence_number_and_return(
-                        ResponseReasoningTextDoneEvent(
-                            type="response.reasoning_text.done",
-                            item_id=current_item_id,
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            content_index=current_content_index,
-                            text=reason_content,
-                        )
-                    )
-                    current_content_index = 0
-                    reasoning_item = ResponseReasoningItem(
-                        type="reasoning",
-                        content=[
-                            ResponseReasoningTextContent(
-                                text=reason_content,
-                                type="reasoning_text",
-                            ),
-                        ],
-                        status="completed",
-                        id=current_item_id,
-                        summary=[],
-                    )
-                    yield _increment_sequence_number_and_return(
-                        ResponseOutputItemDoneEvent(
-                            type="response.output_item.done",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item=reasoning_item,
-                        )
-                    )
-                    yield _increment_sequence_number_and_return(
-                        ResponseOutputItemAddedEvent(
-                            type="response.output_item.added",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item=ResponseOutputMessage(
-                                id=current_item_id,
-                                type="message",
-                                role="assistant",
-                                content=[],
-                                status="in_progress",
-                            ),
-                        )
-                    )
-                    current_output_index += 1
-                    current_item_id = str(uuid.uuid4())
-                    yield _increment_sequence_number_and_return(
-                        ResponseContentPartAddedEvent(
-                            type="response.content_part.added",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                            content_index=current_content_index,
-                            part=ResponseOutputText(
-                                type="output_text",
-                                text="",
-                                annotations=[],
-                                logprobs=[],
-                            ),
-                        )
-                    )
-                    current_content_index += 1
-                    # reset previous delta messages
-                    previous_delta_messages = []
-
-                if delta_message.reasoning is not None:
-                    yield _increment_sequence_number_and_return(
-                        ResponseReasoningTextDeltaEvent(
-                            type="response.reasoning_text.delta",
-                            sequence_number=-1,
-                            content_index=current_content_index,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                            delta=delta_message.reasoning,
-                        )
-                    )
-                elif delta_message.content is not None:
-                    yield _increment_sequence_number_and_return(
-                        ResponseTextDeltaEvent(
-                            type="response.output_text.delta",
-                            sequence_number=-1,
-                            content_index=current_content_index,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                            delta=delta_message.content,
-                            logprobs=(
-                                self._create_stream_response_logprobs(
-                                    token_ids=output.token_ids,
-                                    logprobs=output.logprobs,
-                                    tokenizer=tokenizer,
-                                    top_logprobs=request.top_logprobs,
-                                )
-                                if request.is_include_output_logprobs()
-                                else []
-                            ),
-                        )
-                    )
-                current_content_index += 1
-
-                previous_delta_messages.append(delta_message)
-        if previous_delta_messages:
-            if previous_delta_messages[-1].reasoning is not None:
-                reason_content = "".join(
-                    pm.reasoning
-                    for pm in previous_delta_messages
-                    if pm.reasoning is not None
+        def start_item(kind: str) -> list[StreamingResponsesResponse]:
+            nonlocal current_item_id, current_kind, current_content_index
+            current_item_id = str(uuid.uuid4())
+            current_kind = kind
+            current_content_index = 0
+            current_text_parts.clear()
+            if kind == "reasoning":
+                item = ResponseReasoningItem(
+                    type="reasoning",
+                    id=current_item_id,
+                    summary=[],
+                    status="in_progress",
                 )
-                yield _increment_sequence_number_and_return(
+            else:
+                item = ResponseOutputMessage(
+                    id=current_item_id,
+                    type="message",
+                    role="assistant",
+                    content=[],
+                    status="in_progress",
+                )
+            return [
+                ResponseOutputItemAddedEvent(
+                    type="response.output_item.added",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item=item,
+                ),
+                ResponseContentPartAddedEvent(
+                    type="response.content_part.added",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item_id=current_item_id,
+                    content_index=current_content_index,
+                    part=ResponseOutputText(
+                        type="output_text",
+                        text="",
+                        annotations=[],
+                        logprobs=[],
+                    ),
+                ),
+            ]
+
+        def finish_item() -> list[StreamingResponsesResponse]:
+            if current_kind is None:
+                return []
+            text = "".join(current_text_parts)
+            if current_kind == "reasoning":
+                item = ResponseReasoningItem(
+                    type="reasoning",
+                    content=[
+                        ResponseReasoningTextContent(
+                            text=text,
+                            type="reasoning_text",
+                        )
+                    ],
+                    status="completed",
+                    id=current_item_id,
+                    summary=[],
+                )
+                return [
                     ResponseReasoningTextDoneEvent(
                         type="response.reasoning_text.done",
                         item_id=current_item_id,
                         sequence_number=-1,
                         output_index=current_output_index,
                         content_index=current_content_index,
-                        text=reason_content,
-                    )
-                )
-                current_content_index += 1
-                reasoning_item = ResponseReasoningItem(
-                    type="reasoning",
-                    content=[
-                        ResponseReasoningTextContent(
-                            text=reason_content,
-                            type="reasoning_text",
-                        ),
-                    ],
-                    status="completed",
-                    id=current_item_id,
-                    summary=[],
-                )
-                yield _increment_sequence_number_and_return(
-                    ResponseOutputItemDoneEvent(
-                        type="response.output_item.done",
-                        sequence_number=-1,
-                        output_index=current_output_index,
-                        item=reasoning_item,
-                    )
-                )
-            elif previous_delta_messages[-1].content is not None:
-                final_content = "".join(
-                    pm.content
-                    for pm in previous_delta_messages
-                    if pm.content is not None
-                )
-                yield _increment_sequence_number_and_return(
-                    ResponseTextDoneEvent(
-                        type="response.output_text.done",
-                        sequence_number=-1,
-                        output_index=current_output_index,
-                        content_index=current_content_index,
-                        text=final_content,
-                        logprobs=[],
-                        item_id=current_item_id,
-                    )
-                )
-                current_content_index += 1
-                part = ResponseOutputText(
-                    text=final_content,
-                    type="output_text",
-                    annotations=[],
-                )
-                yield _increment_sequence_number_and_return(
-                    ResponseContentPartDoneEvent(
-                        type="response.content_part.done",
-                        sequence_number=-1,
-                        item_id=current_item_id,
-                        output_index=current_output_index,
-                        content_index=current_content_index,
-                        part=part,
-                    )
-                )
-                current_content_index += 1
-                item = ResponseOutputMessage(
-                    type="message",
-                    role="assistant",
-                    content=[
-                        part,
-                    ],
-                    status="completed",
-                    id=current_item_id,
-                    summary=[],
-                )
-                yield _increment_sequence_number_and_return(
+                        text=text,
+                    ),
                     ResponseOutputItemDoneEvent(
                         type="response.output_item.done",
                         sequence_number=-1,
                         output_index=current_output_index,
                         item=item,
-                    )
+                    ),
+                ]
+            part = ResponseOutputText(
+                text=text,
+                type="output_text",
+                annotations=[],
+            )
+            item = ResponseOutputMessage(
+                type="message",
+                role="assistant",
+                content=[part],
+                status="completed",
+                id=current_item_id,
+                summary=[],
+            )
+            return [
+                ResponseTextDoneEvent(
+                    type="response.output_text.done",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    content_index=current_content_index,
+                    text=text,
+                    logprobs=[],
+                    item_id=current_item_id,
+                ),
+                ResponseContentPartDoneEvent(
+                    type="response.content_part.done",
+                    sequence_number=-1,
+                    item_id=current_item_id,
+                    output_index=current_output_index,
+                    content_index=current_content_index,
+                    part=part,
+                ),
+                ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item=item,
+                ),
+            ]
+
+        async for ctx in result_generator:
+            assert isinstance(ctx, SimpleContext)
+            if ctx.last_output is None or not ctx.last_output.outputs:
+                continue
+            output = ctx.last_output.outputs[0]
+            pending_metadata.append(output.token_ids, output.logprobs)
+            if reasoning_parser:
+                parsed_delta = reasoning_parser.extract_reasoning_streaming(
+                    previous_text=previous_text,
+                    current_text=previous_text + output.text,
+                    delta_text=output.text,
+                    previous_token_ids=previous_token_ids,
+                    current_token_ids=previous_token_ids + output.token_ids,
+                    delta_token_ids=output.token_ids,
                 )
+            else:
+                parsed_delta = DeltaMessage(content=output.text)
+            previous_text += output.text
+            previous_token_ids += output.token_ids
+
+            deltas: list[
+                tuple[
+                    DeltaMessage,
+                    ReasoningParserStreamingMetadataPartition | None,
+                ]
+            ] = []
+            if parsed_delta is not None:
+                partition = (
+                    reasoning_parser.take_reasoning_streaming_metadata_partition()
+                    if reasoning_parser
+                    else None
+                )
+                deltas.append((parsed_delta, partition))
+            if (
+                reasoning_parser
+                and output.finish_reason in _NORMAL_STREAM_FINISH_REASONS
+            ):
+                finalization = reasoning_parser.finalize_reasoning_streaming()
+                if finalization is not None and finalization.delta is not None:
+                    deltas.append(
+                        (
+                            finalization.delta,
+                            reasoning_parser.take_reasoning_streaming_metadata_partition(),
+                        )
+                    )
+
+            # A parser may discover a close in the middle of one engine delta.
+            # Process both fields in order so neither reasoning nor content is
+            # dropped by the Responses item transition.
+            split_deltas: list[
+                tuple[
+                    DeltaMessage,
+                    tuple[list[int], list[dict[int, SampleLogprob]]] | None,
+                ]
+            ] = []
+            for delta, partition in deltas:
+                content_metadata = None
+                if partition is not None:
+                    partition_size = (
+                        partition.reasoning_token_count + partition.content_token_count
+                    )
+                    assert partition_size == len(pending_metadata.token_ids), (
+                        "reasoning metadata partition must cover pending tokens"
+                    )
+                    pending_metadata.take_prefix(partition.reasoning_token_count)
+                    content_metadata = pending_metadata.take_prefix(
+                        partition.content_token_count
+                    )
+                elif delta.reasoning not in (None, ""):
+                    # Reasoning events have no logprobs field. Without an
+                    # explicit token partition, dropping this metadata is safer
+                    # than mislabeling it as output-text metadata.
+                    pending_metadata.clear()
+                    if delta.content is not None:
+                        content_metadata = ([], [])
+                elif delta.content is not None:
+                    content_metadata = pending_metadata.take()
+                elif delta.reasoning == "" or delta.tool_calls:
+                    pending_metadata.clear()
+
+                if delta.reasoning not in (None, ""):
+                    split_deltas.append((DeltaMessage(reasoning=delta.reasoning), None))
+                if delta.content is not None:
+                    split_deltas.append(
+                        (DeltaMessage(content=delta.content), content_metadata)
+                    )
+                elif delta.reasoning == "" and not delta.tool_calls:
+                    # Empty reasoning is a control boundary, not a visible
+                    # reasoning item.
+                    continue
+
+            for delta, delta_metadata in split_deltas:
+                kind = "reasoning" if delta.reasoning is not None else "content"
+                if current_kind != kind:
+                    if current_kind is not None:
+                        for event in finish_item():
+                            yield _increment_sequence_number_and_return(event)
+                        current_output_index += 1
+                    for event in start_item(kind):
+                        yield _increment_sequence_number_and_return(event)
+
+                text_delta = (
+                    delta.reasoning if delta.reasoning is not None else delta.content
+                )
+                assert text_delta is not None
+                current_text_parts.append(text_delta)
+                if kind == "reasoning":
+                    event = ResponseReasoningTextDeltaEvent(
+                        type="response.reasoning_text.delta",
+                        sequence_number=-1,
+                        content_index=current_content_index,
+                        output_index=current_output_index,
+                        item_id=current_item_id,
+                        delta=text_delta,
+                    )
+                else:
+                    event_token_ids, event_raw_logprobs = delta_metadata or ([], [])
+                    if request.is_include_output_logprobs() and event_token_ids:
+                        event_logprobs = self._create_stream_response_logprobs(
+                            token_ids=event_token_ids,
+                            logprobs=event_raw_logprobs,
+                            tokenizer=tokenizer,
+                            top_logprobs=request.top_logprobs,
+                        )
+                    else:
+                        event_logprobs = []
+                    event = ResponseTextDeltaEvent(
+                        type="response.output_text.delta",
+                        sequence_number=-1,
+                        content_index=current_content_index,
+                        output_index=current_output_index,
+                        item_id=current_item_id,
+                        delta=text_delta,
+                        logprobs=event_logprobs,
+                    )
+                yield _increment_sequence_number_and_return(event)
+                current_content_index += 1
+
+        for event in finish_item():
+            yield _increment_sequence_number_and_return(event)
 
     async def _process_harmony_streaming_events(
         self,

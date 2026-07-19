@@ -26,6 +26,10 @@ from vllm.entrypoints.openai.serving_responses import (
 )
 from vllm.entrypoints.tool_server import ToolServer
 from vllm.inputs.data import TokensPrompt as EngineTokensPrompt
+from vllm.reasoning import (
+    ReasoningParserStreamingFinalization,
+    ReasoningParserStreamingMetadataPartition,
+)
 
 
 class MockConversationContext(ConversationContext):
@@ -119,8 +123,19 @@ def test_extract_tool_types(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def _collect_simple_streaming_events(
-    deltas: list[DeltaMessage],
+    deltas: list[DeltaMessage | None],
+    finalization: ReasoningParserStreamingFinalization | None = None,
+    terminal_finish_reason: str = "stop",
+    metadata_calls: list[dict] | None = None,
+    metadata_partitions: (
+        list[ReasoningParserStreamingMetadataPartition | None] | None
+    ) = None,
+    token_ids_per_delta: list[list[int]] | None = None,
 ):
+    from vllm.logprobs import Logprob
+
+    include_logprobs = metadata_calls is not None
+    metadata_calls = metadata_calls if metadata_calls is not None else []
     parser = MagicMock()
     parser_calls = []
     pending_deltas = iter(deltas)
@@ -135,17 +150,55 @@ async def _collect_simple_streaming_events(
         return next(pending_deltas)
 
     parser.extract_reasoning_streaming.side_effect = extract_reasoning_streaming
+    parser.finalize_reasoning_streaming.return_value = finalization
+    if metadata_partitions is None:
+        parser.take_reasoning_streaming_metadata_partition.return_value = None
+    else:
+        parser.take_reasoning_streaming_metadata_partition.side_effect = iter(
+            metadata_partitions
+        )
 
     serving_responses = MagicMock(spec=OpenAIServingResponses)
     serving_responses.reasoning_parser = lambda _tokenizer: parser
 
+    def create_stream_response_logprobs(**kwargs):
+        metadata_calls.append({**kwargs, "token_ids": list(kwargs["token_ids"])})
+        return [
+            {
+                "token": f"token-{token_id}",
+                "logprob": -0.1,
+                "top_logprobs": [],
+            }
+            for token_id in kwargs["token_ids"]
+        ]
+
+    serving_responses._create_stream_response_logprobs.side_effect = (
+        create_stream_response_logprobs
+    )
+
     async def result_generator():
-        for token_id in range(1, len(deltas) + 1):
+        token_ids_per_delta_ = token_ids_per_delta or [
+            [token_id] for token_id in range(1, len(deltas) + 1)
+        ]
+        for delta_index, token_ids in enumerate(token_ids_per_delta_):
             context = SimpleContext()
             output = MagicMock()
-            output.text = f"delta-{token_id}"
-            output.token_ids = [token_id]
-            output.logprobs = None
+            output.text = f"delta-{delta_index + 1}"
+            output.token_ids = token_ids
+            output.logprobs = [
+                {
+                    token_id: Logprob(
+                        logprob=-0.1,
+                        decoded_token=f"token-{token_id}",
+                    )
+                }
+                for token_id in token_ids
+            ]
+            output.finish_reason = (
+                terminal_finish_reason
+                if delta_index == len(token_ids_per_delta_) - 1
+                else None
+            )
             context.last_output = MagicMock(outputs=[output])
             yield context
 
@@ -153,7 +206,14 @@ async def _collect_simple_streaming_events(
         event
         async for event in OpenAIServingResponses._process_simple_streaming_events(
             serving_responses,
-            request=ResponsesRequest(input="test", stream=True, store=False),
+            request=ResponsesRequest(
+                input="test",
+                stream=True,
+                store=False,
+                include=(
+                    ["message.output_text.logprobs"] if include_logprobs else None
+                ),
+            ),
             sampling_params=MagicMock(),
             result_generator=result_generator(),
             context=SimpleContext(),
@@ -227,6 +287,144 @@ async def test_simple_streaming_preserves_nonempty_reasoning_before_boundary():
     assert reasoning_deltas == ["Need to calculate."]
     assert reasoning_done.text == "Need to calculate."
     assert text_deltas == ["The answer is 42."]
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_terminal_finalization_preserves_held_content():
+    wrapper = "<ifm|tool_calls>held tool markup</ifm|tool_calls>"
+    events, _ = await _collect_simple_streaming_events(
+        [DeltaMessage(reasoning="Need lookup."), None],
+        ReasoningParserStreamingFinalization(
+            delta=DeltaMessage(reasoning="", content=wrapper),
+            reasoning_ended=True,
+        ),
+    )
+
+    reasoning_deltas = [
+        event.delta for event in events if event.type == "response.reasoning_text.delta"
+    ]
+    text_deltas = [
+        event.delta for event in events if event.type == "response.output_text.delta"
+    ]
+    assert reasoning_deltas == ["Need lookup."]
+    assert text_deltas == [wrapper]
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_plain_unclosed_output_finalizes_as_content():
+    answer = "Plain answer without a reasoning close."
+    events, _ = await _collect_simple_streaming_events(
+        [None],
+        ReasoningParserStreamingFinalization(
+            delta=DeltaMessage(reasoning="", content=answer),
+            reasoning_ended=True,
+        ),
+    )
+
+    assert not any("reasoning" in event.type for event in events)
+    text_deltas = [
+        event.delta for event in events if event.type == "response.output_text.delta"
+    ]
+    assert text_deltas == [answer]
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_finalized_content_uses_all_pending_logprobs():
+    answer = "Buffered answer."
+    metadata_calls: list[dict] = []
+    events, _ = await _collect_simple_streaming_events(
+        [None, None],
+        ReasoningParserStreamingFinalization(
+            delta=DeltaMessage(reasoning="", content=answer),
+            reasoning_ended=True,
+        ),
+        metadata_calls=metadata_calls,
+    )
+
+    assert len(metadata_calls) == 1
+    assert metadata_calls[0]["token_ids"] == [1, 2]
+    text_delta = next(
+        event for event in events if event.type == "response.output_text.delta"
+    )
+    assert [logprob.token for logprob in text_delta.logprobs] == [
+        "token-1",
+        "token-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_unbuffered_content_keeps_per_delta_logprobs():
+    metadata_calls: list[dict] = []
+    await _collect_simple_streaming_events(
+        [DeltaMessage(content="First"), DeltaMessage(content="Second")],
+        metadata_calls=metadata_calls,
+    )
+
+    assert [call["token_ids"] for call in metadata_calls] == [[1], [2]]
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_combined_delta_keeps_reasoning_and_content():
+    metadata_calls: list[dict] = []
+    events, _ = await _collect_simple_streaming_events(
+        [DeltaMessage(reasoning="Held reasoning", content="Final answer")],
+        metadata_calls=metadata_calls,
+    )
+
+    reasoning_deltas = [
+        event.delta for event in events if event.type == "response.reasoning_text.delta"
+    ]
+    text_deltas = [
+        event.delta for event in events if event.type == "response.output_text.delta"
+    ]
+    assert reasoning_deltas == ["Held reasoning"]
+    assert text_deltas == ["Final answer"]
+    # Responses reasoning events have no logprobs field. Without an explicit
+    # parser partition, reasoning-token metadata must not be mislabeled as
+    # belonging to the following output-text event.
+    assert metadata_calls == []
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_combined_delta_uses_exact_content_partition():
+    metadata_calls: list[dict] = []
+    events, _ = await _collect_simple_streaming_events(
+        [DeltaMessage(reasoning="Held reasoning", content="Final answer")],
+        metadata_calls=metadata_calls,
+        metadata_partitions=[
+            ReasoningParserStreamingMetadataPartition(
+                reasoning_token_count=2,
+                content_token_count=1,
+            )
+        ],
+        token_ids_per_delta=[[1, 2, 3]],
+    )
+
+    assert [call["token_ids"] for call in metadata_calls] == [[3]]
+    text_delta = next(
+        event for event in events if event.type == "response.output_text.delta"
+    )
+    assert [logprob.token for logprob in text_delta.logprobs] == ["token-3"]
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_abort_does_not_finalize_held_content():
+    metadata_calls: list[dict] = []
+    events, _ = await _collect_simple_streaming_events(
+        [None],
+        ReasoningParserStreamingFinalization(
+            delta=DeltaMessage(
+                reasoning="",
+                content="<ifm|tool_calls>held</ifm|tool_calls>",
+            ),
+            reasoning_ended=True,
+        ),
+        terminal_finish_reason="abort",
+        metadata_calls=metadata_calls,
+    )
+
+    assert events == []
+    assert metadata_calls == []
 
 
 class TestInitializeToolSessions:
