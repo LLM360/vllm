@@ -827,6 +827,138 @@ async def test_streaming_reasoning_end_and_k2_tool_call(
         ] == [(call.name, json.loads(call.arguments)) for call in nonstream_calls or []]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "split_reasoning_delta",
+    [False, True],
+    ids=["same_delta", "split_deltas"],
+)
+@pytest.mark.parametrize(
+    "tool_choice, forced_output, expected_finish_reason",
+    [
+        pytest.param(
+            {
+                "type": "function",
+                "function": {"name": "get_weather"},
+            },
+            '{"city":"Tokyo"}',
+            "stop",
+            id="named",
+        ),
+        pytest.param(
+            "required",
+            '[{"name":"get_weather","parameters":{"city":"Tokyo"}}]',
+            "tool_calls",
+            id="required",
+        ),
+    ],
+)
+async def test_forced_tool_streaming_is_independent_of_reasoning_delta_boundary(
+    split_reasoning_delta,
+    tool_choice,
+    forced_output,
+    expected_finish_reason,
+):
+    from vllm.entrypoints.openai.protocol import RequestResponseMetadata
+    from vllm.outputs import CompletionOutput, RequestOutput
+    from vllm.reasoning import ReasoningParserManager
+
+    class FakeK2Tokenizer:
+        def get_vocab(self):
+            return {
+                "<ifm|think>": 1,
+                "</ifm|think>": 2,
+            }
+
+    async def result_generator():
+        model_deltas = (
+            [("</ifm|think>", [2], None), (forced_output, [3], "stop")]
+            if split_reasoning_delta
+            else [(f"</ifm|think>{forced_output}", [2, 3], "stop")]
+        )
+        for text, token_ids, finish_reason in model_deltas:
+            yield RequestOutput(
+                request_id="test-request",
+                prompt="prompt",
+                prompt_token_ids=[10],
+                prompt_logprobs=None,
+                outputs=[
+                    CompletionOutput(
+                        index=0,
+                        text=text,
+                        token_ids=token_ids,
+                        cumulative_logprob=0.0,
+                        logprobs=None,
+                        finish_reason=finish_reason,
+                        stop_reason=None,
+                    )
+                ],
+                finished=finish_reason is not None,
+            )
+
+    serving_chat = object.__new__(OpenAIServingChat)
+    serving_chat.use_harmony = False
+    serving_chat.tool_call_id_type = "random"
+    serving_chat.tool_parser = None
+    serving_chat.reasoning_parser = ReasoningParserManager.get_reasoning_parser("k2_v3")
+    serving_chat.enable_auto_tools = False
+    serving_chat.enable_force_include_usage = False
+    serving_chat.enable_prompt_tokens_details = False
+    serving_chat.enable_log_outputs = False
+    serving_chat.request_logger = None
+    serving_chat.response_role = "assistant"
+    serving_chat.return_tokens_as_token_ids = False
+    serving_chat.log_error_stack = False
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "What is the weather in Tokyo?"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        tool_choice=tool_choice,
+        stream=True,
+    )
+    chunks = []
+    async for event in serving_chat.chat_completion_stream_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="test-request",
+        model_name="test-model",
+        conversation=[{"role": "user", "content": "What is the weather in Tokyo?"}],
+        tokenizer=FakeK2Tokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="test-request"),
+    ):
+        if event.startswith("data: {"):
+            chunks.append(json.loads(event[6:]))
+
+    final_choice = next(
+        chunk["choices"][0]
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["finish_reason"] is not None
+    )
+    assert final_choice["finish_reason"] == expected_finish_reason
+    assert [
+        chunk["choices"][0]["delta"]["reasoning"]
+        for chunk in chunks
+        if chunk["choices"]
+        and chunk["choices"][0]["delta"].get("reasoning") is not None
+    ] == [""]
+    assert len(final_choice["delta"]["tool_calls"]) == 1
+    streamed_tool_call = final_choice["delta"]["tool_calls"][0]
+    assert streamed_tool_call["function"]["name"] == "get_weather"
+    assert json.loads(streamed_tool_call["function"]["arguments"]) == {"city": "Tokyo"}
+
+
 def test_streaming_metadata_accumulators_are_choice_isolated():
     from vllm.entrypoints.openai.serving_engine import StreamingDeltaMetadata
     from vllm.logprobs import Logprob
