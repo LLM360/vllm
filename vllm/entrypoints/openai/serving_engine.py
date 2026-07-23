@@ -97,7 +97,7 @@ from vllm.inputs.parse import (
     is_explicit_encoder_decoder_prompt,
 )
 from vllm.logger import init_logger
-from vllm.logprobs import Logprob, PromptLogprobs
+from vllm.logprobs import Logprob, PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import (  # noqa: F401 - Required to resolve Pydantic error in RequestProcessingMixin
     MultiModalDataDict,
@@ -134,6 +134,53 @@ CompletionLikeRequest: TypeAlias = (
     | ScoreRequest
     | TokenizeCompletionRequest
 )
+
+
+@dataclass
+class StreamingDeltaMetadata:
+    """Metadata held for engine deltas that a stream parser has buffered."""
+
+    include_logprobs: bool = False
+    token_ids: list[int] = field(default_factory=list)
+    logprobs: list[dict[int, Logprob]] = field(default_factory=list)
+
+    def append(
+        self,
+        token_ids: Sequence[int],
+        logprobs: SampleLogprobs | None,
+    ) -> None:
+        token_ids = list(token_ids)
+        if self.include_logprobs:
+            assert logprobs is not None, "Did not output logprobs"
+            assert len(token_ids) == len(logprobs), (
+                "token_ids and logprobs must have the same length"
+            )
+            self.logprobs.extend(logprobs)
+        self.token_ids.extend(token_ids)
+
+    def take(self) -> tuple[list[int], list[dict[int, Logprob]]]:
+        assert not self.include_logprobs or len(self.token_ids) == len(self.logprobs), (
+            "token_ids and logprobs must have the same length"
+        )
+        token_ids = self.token_ids
+        logprobs = self.logprobs
+        self.token_ids = []
+        self.logprobs = []
+        return token_ids, logprobs
+
+    def take_prefix(self, count: int) -> tuple[list[int], list[dict[int, Logprob]]]:
+        assert 0 <= count <= len(self.token_ids), "invalid metadata prefix length"
+        token_ids = self.token_ids[:count]
+        logprobs = self.logprobs[:count] if self.include_logprobs else []
+        del self.token_ids[:count]
+        if self.include_logprobs:
+            del self.logprobs[:count]
+        return token_ids, logprobs
+
+    def clear(self) -> None:
+        self.token_ids.clear()
+        self.logprobs.clear()
+
 
 ChatLikeRequest: TypeAlias = (
     ChatCompletionRequest
@@ -1478,7 +1525,7 @@ class OpenAIServing:
                     for tool_call in tool_call_info.tool_calls
                 )
                 content = tool_call_info.content
-                if content == "":
+                if content == "" and not tool_parser.preserve_empty_content:
                     content = None
             else:
                 # No tool calls.

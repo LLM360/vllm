@@ -36,6 +36,10 @@ class ToolParser:
     derived classes.
     """
 
+    # Keep an empty non-streaming content string instead of normalizing it to
+    # None after successful tool-call extraction.
+    preserve_empty_content = False
+
     def __init__(self, tokenizer: TokenizerLike):
         self.prev_tool_call_arr: list[dict] = []
         # the index of the tool call that is currently being parsed
@@ -113,6 +117,16 @@ class ToolParser:
         raise NotImplementedError(
             "AbstractToolParser.extract_tool_calls_streaming has not been implemented!"
         )
+
+    def finalize_tool_calls_streaming(
+        self, request: ChatCompletionRequest
+    ) -> DeltaMessage | None:
+        """Release parser-held text after normal model completion."""
+        return None
+
+    def has_pending_streaming_output(self) -> bool:
+        """Whether source text is still held without a complete output delta."""
+        return False
 
 
 class ToolParserManager:
