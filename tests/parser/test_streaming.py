@@ -229,7 +229,7 @@ def _boundary_chunks(tokenizer, parser, end_token_id=None):
 
 def test_parse_delta_empty_reasoning_kept_on_boundary(tokenizer, request_obj):
     """Regression: an empty reasoning block that ends in the same delta as a
-    tool call starts must be emitted as reasoning="", matching non-streaming."""
+    tool call starts must be emitted as reasoning="", not dropped."""
     parser = make_parser(tokenizer, reasoning=True, tool=True)
     text = (
         "<think></think>"
@@ -242,6 +242,7 @@ def test_parse_delta_empty_reasoning_kept_on_boundary(tokenizer, request_obj):
     assert any(r is not None and r.reasoning == "" for r in results)
     _, content, tool_calls = collect_fields(results)
     assert content == ""
+    assert len(tool_calls) > 0
     assert tool_calls[0].function.name == "get_weather"
 
 

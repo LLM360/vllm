@@ -954,8 +954,7 @@ class DelegatingParser(Parser):
                 )
             )
 
-            # Keep an empty-string reasoning (an empty reasoning block) as well:
-            # dropping it makes streamed output disagree with non-streaming.
+            # Keep "" too, so streaming matches non-streaming.
             if reasoning_from_this_batch is not None:
                 if delta_message is None:
                     delta_message = DeltaMessage(reasoning=reasoning_from_this_batch)
