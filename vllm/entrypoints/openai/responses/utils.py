@@ -111,7 +111,8 @@ def build_response_output_items(
     tool_call_name_map = build_responses_tool_call_name_map(tools)
     custom_names = custom_tool_names(tools)
 
-    if reasoning:
+    # Keep "" so the turn still carries a reasoning field when it is replayed.
+    if reasoning is not None:
         outputs.append(
             ResponseReasoningItem(
                 id=f"rs_{random_uuid()}",
