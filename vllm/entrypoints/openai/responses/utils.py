@@ -111,7 +111,10 @@ def build_response_output_items(
     tool_call_name_map = build_responses_tool_call_name_map(tools)
     custom_names = custom_tool_names(tools)
 
-    if reasoning:
+    # An empty string means the model produced an empty reasoning block; keep
+    # it as an item so clients can replay it (some chat templates require a
+    # reasoning field on every prior assistant turn).
+    if reasoning is not None:
         outputs.append(
             ResponseReasoningItem(
                 id=f"rs_{random_uuid()}",
